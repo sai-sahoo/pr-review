@@ -1,0 +1,8 @@
+# secrets
+.env
+# python
+.venv/
+__pycache__/
+
+docs
+PLAN.md

@@ -1,0 +1,9 @@
+[project]
+name = "pr-review-backend"
+version = "0.1.0"
+description = "Agentic PR review backend"
+requires-python = ">=3.12"
+dependencies = [
+    "langchain[openai]>=1.4.3",
+    "python-dotenv>=1.2.4",
+]
