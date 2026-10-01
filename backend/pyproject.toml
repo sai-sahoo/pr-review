@@ -4,6 +4,8 @@ version = "0.1.0"
 description = "Agentic PR review backend"
 requires-python = ">=3.12"
 dependencies = [
+    "httpx>=0.28.1",
     "langchain[openai]>=1.4.3",
     "python-dotenv>=1.2.4",
+    "unidiff>=1.0.1",
 ]

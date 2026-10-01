@@ -6,15 +6,10 @@ OpenAI to another provider is a config change, not a code change.
 """
 
 import os
-from pathlib import Path
 from typing import Literal
 
-from dotenv import load_dotenv
 from langchain.chat_models import init_chat_model
 from langchain_core.language_models import BaseChatModel
-
-# Load the project-root .env (one level above backend/) into os.environ.
-load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
 Role = Literal["fast", "smart"]
 
