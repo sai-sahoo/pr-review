@@ -1,15 +1,30 @@
-"""Step 4: review a real PR with a LangGraph:  fetch_pr -> review -> END
+"""Review a real PR with a LangGraph:
+    fetch_pr -> triage -> specialists in parallel -> aggregate
 
 Run:  cd backend && uv run python -m app.review https://github.com/OWNER/REPO/pull/123
       add --show-graph to print the graph as a Mermaid diagram (no API calls)
 """
 
 import argparse
+import time
 
 from app.github_client import GitHubError
 from app.graph import build_graph
 
-SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+
+def describe(node: str, update: dict) -> str:
+    """One progress line for a node's state update."""
+    if node == "fetch_pr":
+        pr = update["pr"]
+        return f"#{pr.number} {pr.title}: {len(pr.files)} files, {len(pr.skipped)} skipped"
+    if node == "triage":
+        plan = update["plan"]
+        return f"run [{', '.join(plan.specialists)}]: {plan.reason}"
+    if node == "specialist":
+        return f"{len(update['raw_findings'])} findings"
+    if node == "aggregate":
+        return f"{len(update['findings'])} findings after dedupe"
+    return ""
 
 
 def main() -> None:
@@ -26,17 +41,21 @@ def main() -> None:
     if not args.pr_url:
         parser.error("pr_url is required")
 
+    start = time.perf_counter()
+    findings = []
     try:
-        # In: the initial state. Out: the final state after the graph reaches END.
-        final = graph.invoke({"pr_url": args.pr_url})
-    except GitHubError as e:  # node exceptions propagate out of invoke() unchanged
+        # stream_mode="updates" yields {node_name: update} each time a node finishes,
+        # so we can watch the graph run. invoke() would only return the end state.
+        for chunk in graph.stream({"pr_url": args.pr_url}, stream_mode="updates"):
+            for node, update in chunk.items():
+                print(f"[{time.perf_counter() - start:5.1f}s] {node:<10} {describe(node, update)}")
+                if node == "aggregate":
+                    findings = update["findings"]
+    except GitHubError as e:  # node exceptions propagate out of the graph unchanged
         raise SystemExit(f"error: {e}")
 
-    pr, findings = final["pr"], final["findings"]
-    print(f"#{pr.number} {pr.title}")
-    print(f"reviewed {len(pr.files)} files, skipped {len(pr.skipped)}")
     print(f"\n=== Findings ({len(findings)}) ===")
-    for f in sorted(findings, key=lambda f: SEVERITY_ORDER[f.severity]):
+    for f in findings:  # aggregate already sorted them by severity
         print(f"\n[{f.severity.upper()}] {f.category} - {f.file}:{f.line}")
         print(f"  {f.title}")
         print(f"  why: {f.explanation}")

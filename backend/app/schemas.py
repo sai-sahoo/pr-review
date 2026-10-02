@@ -11,6 +11,9 @@ from pydantic import BaseModel, Field
 
 Severity = Literal["critical", "high", "medium", "low"]
 Category = Literal["security", "correctness", "performance", "maintainability"]
+Specialist = Literal["security", "correctness", "maintainability"]
+
+SEVERITY_RANK: dict[Severity, int] = {"critical": 0, "high": 1, "medium": 2, "low": 3}
 
 
 class Finding(BaseModel):
@@ -29,6 +32,17 @@ class Review(BaseModel):
     """All findings for one diff. An empty list means the diff looks fine."""
 
     findings: list[Finding]
+
+
+class TriagePlan(BaseModel):
+    """Which specialist reviewers to run for this PR."""
+
+    # `reason` comes first on purpose: the model writes fields in order, so it
+    # explains its thinking before committing to a list.
+    reason: str = Field(description="One sentence explaining the choice.")
+    specialists: list[Specialist] = Field(
+        description="Specialists to run. Empty only if there is nothing to review."
+    )
 
 
 # --- Pull request input (filled by our code, not by the LLM) ---
