@@ -21,7 +21,9 @@ def describe(node: str, update: dict) -> str:
         plan = update["plan"]
         return f"run [{', '.join(plan.specialists)}]: {plan.reason}"
     if node == "specialist":
-        return f"{len(update['raw_findings'])} findings"
+        # Last log line is the summary; the ones before it are the tool calls.
+        *calls, summary = update["tool_log"]
+        return "\n".join([summary, *(f"{'':19}-> {c}" for c in calls)])
     if node == "aggregate":
         return f"{len(update['findings'])} findings after dedupe"
     return ""

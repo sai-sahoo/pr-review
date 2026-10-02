@@ -16,7 +16,11 @@ _COMMON_RULES = """\
 - Report only real problems introduced by the added (+) lines.
 - Each line starts with its line number in the new file; use that number for `line`.
 - Stay inside your focus area; other reviewers cover the rest.
-- No style nitpicks and no invented issues. An empty list is a valid answer."""
+- No style nitpicks and no invented issues. An empty list is a valid answer.
+- If the diff alone is not enough to be sure (you need the rest of a function,
+  a helper it calls, or a definition from another file), call read_file.
+  Don't read files just in case; each read costs time.
+- When you are done, call Review with your findings."""
 
 _FOCUS: dict[Specialist, str] = {
     "security": """\

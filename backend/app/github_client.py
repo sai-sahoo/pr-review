@@ -7,6 +7,7 @@ Same PR endpoint, two representations, chosen by the Accept header:
 
 import os
 import re
+from functools import lru_cache
 
 import httpx
 
@@ -38,10 +39,15 @@ def _client() -> httpx.Client:
     return httpx.Client(base_url=API, headers=headers, timeout=30)
 
 
-def _get(client: httpx.Client, path: str, accept: str) -> httpx.Response:
+def _get(
+    client: httpx.Client,
+    path: str,
+    accept: str,
+    not_found: str = "PR not found. Check the URL; private repos need GITHUB_TOKEN.",
+) -> httpx.Response:
     resp = client.get(path, headers={"Accept": accept})
     if resp.status_code == 404:
-        raise GitHubError("PR not found. Check the URL; private repos need GITHUB_TOKEN.")
+        raise GitHubError(not_found)
     if resp.status_code in (403, 429):
         raise GitHubError("GitHub refused the request (likely rate limit). Set GITHUB_TOKEN in .env.")
     if resp.status_code == 406:
@@ -76,3 +82,18 @@ def get_pull_request(url: str, token_budget: int = DEFAULT_TOKEN_BUDGET) -> Pull
         files=files,
         skipped=skipped + over_budget,
     )
+
+
+# Several specialists often read the same file. A commit sha never changes,
+# so caching by (owner, repo, sha, path) is always safe.
+@lru_cache(maxsize=256)
+def get_file_text(owner: str, repo: str, sha: str, path: str) -> str:
+    """Full text of one file as of a specific commit."""
+    with _client() as client:
+        resp = _get(
+            client,
+            f"/repos/{owner}/{repo}/contents/{path}?ref={sha}",
+            "application/vnd.github.raw+json",  # raw file bytes instead of base64 JSON
+            not_found=f"{path} does not exist at commit {sha[:7]}",
+        )
+    return resp.text

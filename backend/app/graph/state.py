@@ -20,6 +20,8 @@ class ReviewState(TypedDict):
     # Without it, LangGraph raises InvalidUpdateError on parallel writes.
     raw_findings: Annotated[list[Finding], operator.add]
 
+    tool_log: Annotated[list[str], operator.add]  # each specialist appends what it did
+
     findings: NotRequired[list[Finding]]  # written by aggregate: deduped and sorted
 
 

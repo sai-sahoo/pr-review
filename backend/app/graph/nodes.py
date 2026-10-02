@@ -9,10 +9,11 @@ from langgraph.types import Send
 
 from app.diff import number_hunk
 from app.github_client import get_pull_request
-from app.graph.prompts import SPECIALIST_PROMPTS, TRIAGE_PROMPT
+from app.graph.agent import run_specialist
+from app.graph.prompts import TRIAGE_PROMPT
 from app.graph.state import ReviewState, SpecialistInput
 from app.llm import get_model
-from app.schemas import SEVERITY_RANK, Finding, PullRequest, Review, TriagePlan
+from app.schemas import SEVERITY_RANK, Finding, PullRequest, TriagePlan
 
 MAX_DESCRIPTION_CHARS = 2000  # PR bodies can be huge templates; the diff matters more
 
@@ -62,12 +63,10 @@ def route_to_specialists(state: ReviewState) -> list[Send] | str:
 
 
 def specialist(state: SpecialistInput) -> dict:
-    reviewer = get_model("smart").with_structured_output(Review)
-    result = reviewer.invoke(
-        [SystemMessage(SPECIALIST_PROMPTS[state["focus"]]), HumanMessage(format_pr(state["pr"]))]
-    )
-    # Goes through the operator.add reducer: appended, not overwritten.
-    return {"raw_findings": result.findings}
+    pr = state["pr"]
+    findings, log = run_specialist(pr, state["focus"], format_pr(pr))
+    # Both keys go through operator.add reducers: appended, not overwritten.
+    return {"raw_findings": findings, "tool_log": log}
 
 
 def aggregate(state: ReviewState) -> dict:
