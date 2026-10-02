@@ -6,11 +6,16 @@ Two jobs:
 2. Keep the rest under a token budget so the prompt fits the model.
 """
 
+import re
+
 from unidiff import PatchedFile, PatchSet
 
 from app.schemas import ChangedFile, SkippedFile
 
 DEFAULT_TOKEN_BUDGET = 30_000
+
+# "@@ -10,7 +12,9 @@ def foo():" -> captures 12, where the hunk starts in the NEW file
+HUNK_HEADER_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)")
 
 # Generated files: huge diffs, never hand-written, nothing to review.
 IGNORED_FILENAMES = {"package-lock.json", "pnpm-lock.yaml", "go.sum"}
@@ -66,6 +71,25 @@ def parse_diff(diff_text: str) -> tuple[list[ChangedFile], list[SkippedFile]]:
             )
         )
     return files, skipped
+
+
+def number_hunk(hunk: str) -> str:
+    """Prefix each line with its line number in the NEW file.
+
+    LLMs are bad at counting lines, and Finding.line must be a new-file
+    line number, so we compute it in code and show it in the prompt.
+    '+' and ' ' lines exist in the new file and get a number; '-' lines don't.
+    """
+    header, *lines = hunk.splitlines()
+    new_line = int(HUNK_HEADER_RE.match(header).group(1))
+    out = [header]
+    for line in lines:
+        if line.startswith(("-", "\\")):  # removed line, or "\ No newline at end of file"
+            out.append(f"     {line}")
+        else:
+            out.append(f"{new_line:>4} {line}")
+            new_line += 1
+    return "\n".join(out)
 
 
 def apply_budget(
