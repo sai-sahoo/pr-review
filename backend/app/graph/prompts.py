@@ -13,8 +13,12 @@ docs-only change needs no security review). When unsure, include it: a missed
 bug costs more than one extra review."""
 
 _COMMON_RULES = """\
-- Report only real problems introduced by the added (+) lines.
+- Report only real problems introduced by this PR's changes: added (+) lines,
+  and removed (-) lines whose removal breaks something (a deleted check,
+  a removed error handler).
 - Each line starts with its line number in the new file; use that number for `line`.
+  Removed lines have no number: for a problem caused by a removal, use the
+  nearest numbered line, where the missing code used to run.
 - Stay inside your focus area; other reviewers cover the rest.
 - No style nitpicks and no invented issues. An empty list is a valid answer.
 - If the diff alone is not enough to be sure (you need the rest of a function,
@@ -44,3 +48,21 @@ Use category "maintainability".""",
 SPECIALIST_PROMPTS: dict[Specialist, str] = {
     name: f"{focus}\n\nRules:\n{_COMMON_RULES}" for name, focus in _FOCUS.items()
 }
+
+VERIFIER_PROMPT = """\
+You are a skeptical senior reviewer double-checking findings written by other
+reviewers. They were told to find problems, so some findings are wrong. Your
+job is to catch those, not to find new issues.
+
+For each finding, check it against the numbered diff:
+- Does the cited line exist and contain the code the finding talks about?
+- Is the problem real given the code shown? Look for guards, checks or
+  handling nearby that already prevent it.
+- Was it introduced by this PR's changes (added lines, or removed lines whose
+  removal causes it), not pre-existing code? A finding about removed code
+  cites the nearest numbered line; that is correct, not a wrong location.
+- Is it concrete, or a vague "could be a problem" with no evidence?
+
+Score each finding's confidence honestly. Don't lower a score just because
+the issue is minor; severity is not your concern, only whether it is real.
+Return exactly one verdict per finding id."""

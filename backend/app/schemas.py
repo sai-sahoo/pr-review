@@ -45,6 +45,41 @@ class TriagePlan(BaseModel):
     )
 
 
+class Verdict(BaseModel):
+    """The verifier's judgement on one finding."""
+
+    id: int = Field(description="The finding's [id] from the list.")
+    # reason before confidence: evidence first, then the score it supports.
+    reason: str = Field(
+        description="What you checked in the code and what you concluded, in one or two sentences."
+    )
+    confidence: float = Field(
+        ge=0,
+        le=1,
+        description=(
+            "How likely this is a real problem. 0.9+: the code shown clearly has it. "
+            "~0.5: plausible but depends on code you cannot see. "
+            "Below 0.3: the code contradicts it, or it is speculative."
+        ),
+    )
+
+
+class VerifierReport(BaseModel):
+    """One verdict per finding."""
+
+    verdicts: list[Verdict]
+
+
+class FindingCheck(BaseModel):
+    """What the verify step decided about one finding, and why (filled by our code)."""
+
+    finding: Finding
+    kept: bool
+    stage: Literal["grounding", "verifier"]  # which check made the decision
+    confidence: float | None  # verifier's score; None if it never got a score
+    reason: str
+
+
 # --- Pull request input (filled by our code, not by the LLM) ---
 
 

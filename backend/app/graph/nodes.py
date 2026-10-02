@@ -12,6 +12,7 @@ from app.github_client import get_pull_request
 from app.graph.agent import run_specialist
 from app.graph.prompts import TRIAGE_PROMPT
 from app.graph.state import ReviewState, SpecialistInput
+from app.graph.verifier import verify_findings
 from app.llm import get_model
 from app.schemas import SEVERITY_RANK, Finding, PullRequest, TriagePlan
 
@@ -82,3 +83,11 @@ def aggregate(state: ReviewState) -> dict:
             best[key] = f
     findings = sorted(best.values(), key=lambda f: (SEVERITY_RANK[f.severity], f.file, f.line))
     return {"findings": findings}
+
+
+def verify(state: ReviewState) -> dict:
+    """Critic pass: drop findings that are ungrounded or not convincing."""
+    pr = state["pr"]
+    checks = verify_findings(pr, state["findings"], format_pr(pr))
+    # Filtering keeps aggregate's severity order, so no re-sort needed.
+    return {"checks": checks, "verified": [c.finding for c in checks if c.kept]}

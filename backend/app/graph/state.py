@@ -7,7 +7,7 @@ changed. LangGraph merges that dict into the state before the next step.
 import operator
 from typing import Annotated, NotRequired, TypedDict
 
-from app.schemas import Finding, PullRequest, Specialist, TriagePlan
+from app.schemas import Finding, FindingCheck, PullRequest, Specialist, TriagePlan
 
 
 class ReviewState(TypedDict):
@@ -23,6 +23,10 @@ class ReviewState(TypedDict):
     tool_log: Annotated[list[str], operator.add]  # each specialist appends what it did
 
     findings: NotRequired[list[Finding]]  # written by aggregate: deduped and sorted
+
+    # written by verify
+    checks: NotRequired[list[FindingCheck]]  # every finding with its verdict, kept or not
+    verified: NotRequired[list[Finding]]  # only the kept ones, sorted: the final answer
 
 
 class SpecialistInput(TypedDict):

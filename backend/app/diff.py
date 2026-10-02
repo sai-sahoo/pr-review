@@ -73,23 +73,41 @@ def parse_diff(diff_text: str) -> tuple[list[ChangedFile], list[SkippedFile]]:
     return files, skipped
 
 
+def _walk_hunk(hunk: str):
+    """Yield (new_line_number, line) for each line after the header.
+
+    '+' and ' ' lines exist in the new file and get a number; '-' lines
+    (and "\\ No newline at end of file") don't, so they get None.
+    """
+    header, *lines = hunk.splitlines()
+    new_line = int(HUNK_HEADER_RE.match(header).group(1))
+    for line in lines:
+        if line.startswith(("-", "\\")):
+            yield None, line
+        else:
+            yield new_line, line
+            new_line += 1
+
+
 def number_hunk(hunk: str) -> str:
     """Prefix each line with its line number in the NEW file.
 
     LLMs are bad at counting lines, and Finding.line must be a new-file
     line number, so we compute it in code and show it in the prompt.
-    '+' and ' ' lines exist in the new file and get a number; '-' lines don't.
     """
-    header, *lines = hunk.splitlines()
-    new_line = int(HUNK_HEADER_RE.match(header).group(1))
-    out = [header]
-    for line in lines:
-        if line.startswith(("-", "\\")):  # removed line, or "\ No newline at end of file"
-            out.append(f"     {line}")
-        else:
-            out.append(f"{new_line:>4} {line}")
-            new_line += 1
+    out = [hunk.splitlines()[0]]  # the @@ header, unchanged
+    for n, line in _walk_hunk(hunk):
+        out.append(f"     {line}" if n is None else f"{n:>4} {line}")
     return "\n".join(out)
+
+
+def diff_line_numbers(hunks: list[str]) -> set[int]:
+    """New-file line numbers visible in these hunks ('+' and context lines).
+
+    A finding must point at one of these: it's what the reviewer was shown,
+    and the only lines GitHub accepts inline comments on.
+    """
+    return {n for h in hunks for n, _ in _walk_hunk(h) if n is not None}
 
 
 def apply_budget(
