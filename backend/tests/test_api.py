@@ -5,6 +5,8 @@ POST comes back the review has already run. The real server would still be
 "running" at that moment; here we can check the end state deterministically.
 """
 
+import json
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -12,26 +14,47 @@ from app.api.main import create_app
 from app.github_client import GitHubError
 from app.graph.prompts import SPECIALIST_PROMPTS, TRIAGE_PROMPT, VERIFIER_PROMPT
 from fakes import by_system_prompt, scripted, tool_call
-from sample_pr import finding, make_pr
+from sample_pr import PATH, PAYMENTS_PY, finding, make_pr
 
 PR_URL = "https://github.com/acme/shop/pull/7"
 
 
 @pytest.fixture
 def client():
-    return TestClient(create_app())  # a fresh store per test
+    # `with` keeps one event loop for the whole test. Without it, each request
+    # gets its own loop, and the store's asyncio.Condition must stay on one.
+    with TestClient(create_app()) as client:  # a fresh store per test
+        yield client
 
 
-def test_review_lifecycle(client, fake_llm, fake_github):
-    fake_github(make_pr())
-    bug = finding(line=11, severity="critical")
+def read_sse(client, review_id, **headers) -> list[tuple[str, str, dict]]:
+    """GET the event stream and parse it into (id, event, data) triples."""
+    resp = client.get(f"/reviews/{review_id}/events", headers=headers)
+    assert resp.headers["content-type"].startswith("text/event-stream")
+    events = []
+    for block in filter(None, resp.text.strip().split("\n\n")):  # a blank line ends each event
+        fields = dict(line.split(": ", 1) for line in block.splitlines())
+        events.append((fields["id"], fields["event"], json.loads(fields["data"])))
+    return events
+
+
+def script_one_bug(fake_llm, fake_github):
+    """A full run: the correctness agent reads a file, then reports one bug."""
+    fake_github(make_pr(), files={PATH: PAYMENTS_PY})
     fake_llm(by_system_prompt({
         TRIAGE_PROMPT: scripted(tool_call("TriagePlan", reason="r", specialists=["correctness"])),
-        SPECIALIST_PROMPTS["correctness"]: scripted(tool_call("Review", findings=[bug.model_dump()])),
+        SPECIALIST_PROMPTS["correctness"]: scripted(
+            tool_call("read_file", path=PATH, start_line=1, end_line=20),
+            tool_call("Review", findings=[finding(line=11, severity="critical").model_dump()]),
+        ),
         VERIFIER_PROMPT: scripted(tool_call("VerifierReport", verdicts=[
             {"id": 0, "reason": "real", "confidence": 0.9},
         ])),
     }))
+
+
+def test_review_lifecycle(client, fake_llm, fake_github):
+    script_one_bug(fake_llm, fake_github)
 
     resp = client.post("/reviews", json={"pr_url": PR_URL})
     assert resp.status_code == 202
@@ -83,3 +106,58 @@ def test_crash_marks_review_failed_instead_of_stuck_running(client):
 
     assert body["status"] == "failed"
     assert body["error"].startswith("internal error:")
+
+
+def test_event_stream_tells_the_whole_story_in_order(client, fake_llm, fake_github):
+    script_one_bug(fake_llm, fake_github)
+    review_id = client.post("/reviews", json={"pr_url": PR_URL}).json()["id"]
+
+    events = read_sse(client, review_id)
+
+    assert [i for i, _, _ in events] == [str(n) for n in range(len(events))]
+    assert [(name, data.get("node") or data.get("status")) for _, name, data in events] == [
+        ("status", "running"),
+        ("node", "fetch_pr"),
+        ("node", "triage"),
+        ("agent", None),  # read_file, sent while the specialist was still running
+        ("agent", None),  # submitted
+        ("node", "specialist"),
+        ("node", "aggregate"),
+        ("node", "verify"),
+        ("done", None),
+    ]
+    data = [d for _, _, d in events]
+    assert data[3] == {"type": "agent", "agent": "correctness", "tool": "read_file",
+                       "args": {"path": PATH, "start_line": 1, "end_line": 20}}
+    assert data[4] == {"type": "agent", "agent": "correctness", "submitted": 1}
+    assert [f["line"] for f in data[5]["findings"]] == [11]
+    assert data[-1] == {"type": "done", "kept": 1}
+
+
+def test_reconnect_resumes_after_last_event_id(client, fake_llm, fake_github):
+    script_one_bug(fake_llm, fake_github)
+    review_id = client.post("/reviews", json={"pr_url": PR_URL}).json()["id"]
+    everything = read_sse(client, review_id)
+
+    resumed = read_sse(client, review_id, **{"Last-Event-ID": "5"})
+
+    assert resumed == everything[6:]
+    # Already past the final event: the stream ends at once instead of hanging.
+    assert read_sse(client, review_id, **{"Last-Event-ID": everything[-1][0]}) == []
+
+
+def test_failed_review_stream_ends_with_failed(client, monkeypatch):
+    def not_found(url):
+        raise GitHubError("PR not found.")
+
+    monkeypatch.setattr("app.graph.nodes.get_pull_request", not_found)
+    review_id = client.post("/reviews", json={"pr_url": PR_URL}).json()["id"]
+
+    events = read_sse(client, review_id)
+
+    assert [name for _, name, _ in events] == ["status", "failed"]
+    assert events[-1][2] == {"type": "failed", "error": "PR not found."}
+
+
+def test_events_for_unknown_id_is_a_404(client):
+    assert client.get("/reviews/does-not-exist/events").status_code == 404

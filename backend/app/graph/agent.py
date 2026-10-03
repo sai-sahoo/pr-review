@@ -4,6 +4,8 @@ LangChain ships a prebuilt version (langchain.agents.create_agent). We write
 it ourselves once so nothing about "agents" is magic.
 """
 
+from collections.abc import Callable
+
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 
 from app.graph.prompts import SPECIALIST_PROMPTS
@@ -14,8 +16,17 @@ from app.schemas import Finding, PullRequest, Review, Specialist
 MAX_TOOL_ROUNDS = 4  # after this many rounds of reading, the model must submit
 
 
-def run_specialist(pr: PullRequest, focus: Specialist, diff_text: str) -> tuple[list[Finding], list[str]]:
-    """Run one specialist agent. Returns its findings and a log of its tool calls."""
+def run_specialist(
+    pr: PullRequest,
+    focus: Specialist,
+    diff_text: str,
+    emit: Callable[[dict], None] = lambda event: None,
+) -> tuple[list[Finding], list[str]]:
+    """Run one specialist agent. Returns its findings and a log of its tool calls.
+
+    `emit` reports each tool call, and the final submit, the moment it
+    happens. The default does nothing, so this works outside a graph too.
+    """
     read_file = make_read_file(pr)
     tools = {read_file.name: read_file}
 
@@ -39,6 +50,7 @@ def run_specialist(pr: PullRequest, focus: Specialist, diff_text: str) -> tuple[
             if call["name"] == "Review":
                 findings = Review.model_validate(call["args"]).findings
                 log.append(f"{focus}: submitted {len(findings)} findings after {round_no} tool rounds")
+                emit({"agent": focus, "submitted": len(findings)})
                 return findings, log
 
         for call in ai.tool_calls:  # ACT: run every tool the model asked for
@@ -46,6 +58,7 @@ def run_specialist(pr: PullRequest, focus: Specialist, diff_text: str) -> tuple[
             result = tool.invoke(call["args"]) if tool else f"error: unknown tool {call['name']!r}"
             args = ", ".join(f"{k}={v!r}" for k, v in call["args"].items())
             log.append(f"{focus}: {call['name']}({args})")
+            emit({"agent": focus, "tool": call["name"], "args": call["args"]})
             # OBSERVE: the result goes back in, linked to the request by its id
             messages.append(ToolMessage(result, tool_call_id=call["id"]))
 

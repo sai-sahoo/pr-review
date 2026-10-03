@@ -5,6 +5,7 @@ build.py, which is why the same `specialist` node can run three times at once.
 """
 
 from langchain_core.messages import HumanMessage, SystemMessage
+from langgraph.config import get_stream_writer
 from langgraph.types import Send
 
 from app.diff import number_hunk
@@ -65,7 +66,9 @@ def route_to_specialists(state: ReviewState) -> list[Send] | str:
 
 def specialist(state: SpecialistInput) -> dict:
     pr = state["pr"]
-    findings, log = run_specialist(pr, state["focus"], format_pr(pr))
+    # The writer sends custom events to stream_mode="custom" listeners while the
+    # node is still running. With no such listener, writing is a no-op.
+    findings, log = run_specialist(pr, state["focus"], format_pr(pr), emit=get_stream_writer())
     # Both keys go through operator.add reducers: appended, not overwritten.
     return {"raw_findings": findings, "tool_log": log}
 
