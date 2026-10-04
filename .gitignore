@@ -6,4 +6,8 @@ __pycache__/
 
 docs
 PLAN.md
-my-test.py
+my-test.py# node / next.js
+node_modules/
+.next/
+next-env.d.ts
+*.tsbuildinfo

@@ -81,6 +81,21 @@ def test_missing_body_field_is_a_422(client):
     assert client.post("/reviews", json={}).status_code == 422  # Pydantic validation
 
 
+def test_cors_lets_the_frontend_call_the_api(client):
+    # Before a JSON POST from another origin, the browser asks with OPTIONS.
+    resp = client.options("/reviews", headers={
+        "Origin": "http://localhost:3000",
+        "Access-Control-Request-Method": "POST",
+        "Access-Control-Request-Headers": "content-type",
+    })
+    assert resp.status_code == 200
+    assert resp.headers["access-control-allow-origin"] == "http://localhost:3000"
+
+    # Any other origin gets no allow header, so the browser blocks it.
+    resp = client.get("/reviews", headers={"Origin": "https://evil.example"})
+    assert "access-control-allow-origin" not in resp.headers
+
+
 def test_unknown_id_is_a_404(client):
     assert client.get("/reviews/does-not-exist").status_code == 404
 

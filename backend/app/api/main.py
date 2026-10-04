@@ -11,11 +11,13 @@ Run:  cd backend && uv run uvicorn app.api.main:app --reload
 """
 
 import logging
+import os
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from typing import Annotated
 
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.sse import EventSourceResponse, ServerSentEvent
 from pydantic import BaseModel
 
@@ -26,6 +28,11 @@ from app.graph import build_graph
 
 log = logging.getLogger(__name__)
 
+# The Next.js UI runs on another port, which makes it another "origin". Browsers
+# block a page from reading responses from a different origin unless the server
+# says that origin is allowed. Comma-separated, so you can list several.
+FRONTEND_ORIGINS = os.getenv("FRONTEND_ORIGINS", "http://localhost:3000").split(",")
+
 
 class ReviewRequest(BaseModel):
     pr_url: str
@@ -34,6 +41,14 @@ class ReviewRequest(BaseModel):
 def create_app() -> FastAPI:
     """Build a fresh app with its own store. Tests call this to start clean."""
     app = FastAPI(title="pr-review")
+    # Adds the Access-Control-Allow-* headers, and answers the browser's
+    # OPTIONS "preflight" question before a JSON POST.
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=FRONTEND_ORIGINS,
+        allow_methods=["GET", "POST"],
+        allow_headers=["*"],
+    )
     store = ReviewStore()
     graph = build_graph()  # compiled once, reused by every request
 
