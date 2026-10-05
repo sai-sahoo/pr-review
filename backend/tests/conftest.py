@@ -5,11 +5,18 @@ Patch where a name is *looked up*, not where it is defined: nodes.py did
 app.llm.get_model would not touch it.
 """
 
-import pytest
+import os
 
-from app.github_client import GitHubError
-from app.schemas import PullRequest
-from fakes import FakeChatModel, Responder
+# Before any `import app`: app/__init__ loads .env but never overrides a
+# variable that's already set. So the module-level app in app.api.main gets a
+# throwaway in-memory SQLite database, and no test can touch your Postgres.
+os.environ["DATABASE_URL"] = "sqlite+aiosqlite://"
+
+import pytest  # noqa: E402  (the env var above must come first)
+
+from app.github_client import GitHubError  # noqa: E402
+from app.schemas import PullRequest  # noqa: E402
+from fakes import FakeChatModel, Responder  # noqa: E402
 
 LLM_SEAMS = ["app.graph.nodes.get_model", "app.graph.agent.get_model", "app.graph.verifier.get_model"]
 GITHUB_SEAMS = ["app.graph.nodes.get_pull_request", "app.graph.tools.get_file_text"]

@@ -1,0 +1,22 @@
+# Local infrastructure. Start:  docker compose up -d     Stop:  docker compose down
+# Data lives in the named volume, so it survives `down`. `down -v` wipes it.
+services:
+  postgres:
+    image: postgres:18
+    environment:
+      POSTGRES_USER: pr_review
+      POSTGRES_PASSWORD: pr_review # local dev only; never a real password
+      POSTGRES_DB: pr_review
+    ports:
+      - "5432:5432" # host:container, so the backend on your machine can reach it
+    volumes:
+      # Postgres 18+ images keep their data under /var/lib/postgresql
+      - pgdata:/var/lib/postgresql
+    healthcheck: # `docker compose ps` shows "healthy" once it accepts connections
+      test: ["CMD-SHELL", "pg_isready -U pr_review -d pr_review"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+volumes:
+  pgdata:

@@ -4,13 +4,14 @@
                                 \\-------- (empty plan) --------/
 """
 
+from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
 
 from app.graph.nodes import aggregate, fetch_pr, route_to_specialists, specialist, triage, verify
 from app.graph.state import ReviewState
 
 
-def build_graph():
+def build_graph(checkpointer: BaseCheckpointSaver | None = None):
     builder = StateGraph(ReviewState)  # the state schema every node shares
 
     builder.add_node("fetch_pr", fetch_pr)
@@ -30,5 +31,6 @@ def build_graph():
     builder.add_edge("verify", END)
 
     # compile() validates the wiring (no dangling nodes, no missing edges)
-    # and returns a runnable with .invoke() / .stream()
-    return builder.compile()
+    # and returns a runnable with .invoke() / .stream().
+    # With a checkpointer, every step's state is saved under the run's thread_id.
+    return builder.compile(checkpointer=checkpointer)
