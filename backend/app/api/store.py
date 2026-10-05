@@ -3,18 +3,19 @@
 Same methods as the Step 9 dict store, now `async`: each one waits for the
 database, and while it waits the event loop serves other requests.
 
-One thing stays in memory: a per-review "new event!" signal that wakes up the
-SSE handlers. It only reaches handlers in this same process. Step 13 swaps it
-for Redis pub/sub, so several processes can share it.
+Reviews now run in a worker process, while the SSE handlers live in the API
+process. So the "new event!" signal goes through Redis pub/sub: add_event
+publishes on the review's channel, follow subscribes to it. The message is
+only a wake-up call; the events themselves are always read from Postgres.
 """
 
-import asyncio
 import uuid
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
+from redis.asyncio import Redis
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
@@ -24,6 +25,11 @@ from app.schemas import Finding, FindingCheck
 
 Status = Literal["queued", "running", "done", "failed"]
 UNFINISHED = ["queued", "running"]
+
+# Pub/sub is fire-and-forget: a message sent while nobody listens, or lost in
+# a Redis reconnect, is gone. So a waiting reader also re-checks the database
+# this often, even without a message. A missed message costs a delay, never a hang.
+POLL_SECONDS = 15
 
 
 def _now() -> datetime:
@@ -61,16 +67,16 @@ def _to_columns(record: ReviewRecord) -> dict[str, Any]:
     return columns
 
 
+def _channel(review_id: str) -> str:
+    return f"review:{review_id}:events"
+
+
 class ReviewStore:
-    def __init__(self, sessions: async_sessionmaker) -> None:
+    def __init__(self, sessions: async_sessionmaker, redis: Redis) -> None:
         # Each `async with self._sessions()` borrows a connection from the
         # pool and gives it back at the end of the block.
         self._sessions = sessions
-
-        # In-memory wake-up signal, per review: the seq of its newest event,
-        # and a Condition the SSE handlers sleep on until that number grows.
-        self._last_seq: dict[str, int] = {}
-        self._new_event: dict[str, asyncio.Condition] = {}
+        self._redis = redis
 
     async def create(self, pr_url: str) -> ReviewRecord:
         record = ReviewRecord(pr_url=pr_url)
@@ -106,10 +112,6 @@ class ReviewStore:
         return record
 
     # --- events ---------------------------------------------------------
-    # Only ever called from the event loop: asyncio.Condition is not thread-safe.
-
-    def _condition(self, review_id: str) -> asyncio.Condition:
-        return self._new_event.setdefault(review_id, asyncio.Condition())
 
     async def add_event(self, review_id: str, event: dict[str, Any]) -> None:
         async with self._sessions.begin() as session:
@@ -118,44 +120,47 @@ class ReviewStore:
             last = await session.scalar(select(func.max(EventRow.seq)).where(EventRow.review_id == review_id))
             seq = 0 if last is None else last + 1
             session.add(EventRow(review_id=review_id, seq=seq, type=event["type"], data=event))
-        # Committed, so any reader that wakes up now will find the row.
-        self._last_seq[review_id] = seq
-        condition = self._condition(review_id)
-        async with condition:  # notify_all() requires holding the condition's lock
-            condition.notify_all()
+        # Committed, so any reader that wakes up now will find the row. Every
+        # process subscribed to this channel gets the message (the seq is just
+        # for logs and redis-cli; readers don't need it).
+        await self._redis.publish(_channel(review_id), seq)
 
     async def follow(self, review_id: str, start: int = 0) -> AsyncIterator[tuple[int, dict[str, Any]]]:
         """Yield (seq, event) from `start` on: first the stored ones, then live
         ones as they arrive. Ends after the done/failed event.
         """
-        i = start
-        while True:
-            async with self._sessions() as session:
-                rows = (await session.scalars(
-                    select(EventRow)
-                    .where(EventRow.review_id == review_id, EventRow.seq >= i)
-                    .order_by(EventRow.seq)
-                )).all()
-                if not rows:
-                    # Nothing new. Already past the final event (a resume after
-                    # done/failed)? Then end now instead of waiting forever.
-                    newest = await session.scalar(
-                        select(EventRow.type).where(EventRow.review_id == review_id)
-                        .order_by(EventRow.seq.desc()).limit(1)
-                    )
-                    if newest in TERMINAL:
+        async with self._redis.pubsub() as pubsub:
+            # Subscribe *before* the first SELECT. An event stored after this
+            # line sends us a message; one stored before it is in the SELECT.
+            # Subscribing after the SELECT would leave a gap where an event
+            # could slip through unseen.
+            await pubsub.subscribe(_channel(review_id))
+            i = start
+            while True:
+                async with self._sessions() as session:
+                    rows = (await session.scalars(
+                        select(EventRow)
+                        .where(EventRow.review_id == review_id, EventRow.seq >= i)
+                        .order_by(EventRow.seq)
+                    )).all()
+                    if not rows:
+                        # Nothing new. Already past the final event (a resume after
+                        # done/failed)? Then end now instead of waiting forever.
+                        newest = await session.scalar(
+                            select(EventRow.type).where(EventRow.review_id == review_id)
+                            .order_by(EventRow.seq.desc()).limit(1)
+                        )
+                        if newest in TERMINAL:
+                            return
+                # The connection is back in the pool before we yield: a slow client
+                # must not hold one for minutes.
+                for row in rows:
+                    yield row.seq, row.data
+                    if row.type in TERMINAL:
                         return
-            # The connection is back in the pool before we yield: a slow client
-            # must not hold one for minutes.
-            for row in rows:
-                yield row.seq, row.data
-                if row.type in TERMINAL:
-                    return
-                i = row.seq + 1
+                    i = row.seq + 1
 
-            condition = self._condition(review_id)
-            async with condition:
-                # Sleep until add_event stores an event at position i or later.
-                # wait_for checks first, so an event added between our SELECT
-                # and this line is not missed.
-                await condition.wait_for(lambda: self._last_seq.get(review_id, -1) >= i)
+                # Sleep until a message arrives (or POLL_SECONDS pass), then
+                # SELECT again. The first call returns at once with None: that
+                # was Redis confirming the subscription, which we skip.
+                await pubsub.get_message(ignore_subscribe_messages=True, timeout=POLL_SECONDS)

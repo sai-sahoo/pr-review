@@ -1,26 +1,34 @@
-"""The HTTP layer: status codes, the job lifecycle, and error handling.
+"""The HTTP layer and the worker: status codes, the job lifecycle, and error handling.
 
-Each review runs as an asyncio task on the app's event loop. Tests call
-wait_for_jobs() after a POST, so they check the end state deterministically.
-(read_sse needs no wait: the stream itself waits for the done/failed event.)
+POST only queues a job, so tests call run_worker() afterwards: a real arq
+worker, in burst mode, runs every queued review and then stops. Queue and
+pub/sub go through fakeredis, an in-memory Redis, on the app's event loop.
 
 Each test gets its own SQLite file instead of Postgres: no Docker needed, and
 nothing leaks between tests. The tables come from Base.metadata.create_all,
 the quick way; the real database gets them from Alembic migrations.
 """
 
-import asyncio
 import json
 
 import pytest
+from arq import ArqRedis
+from arq.worker import create_worker
+from fakeredis import FakeServer
+from fakeredis.aioredis import FakeAsyncRedisConnection
 from fastapi.testclient import TestClient
+from redis.asyncio import ConnectionPool
+from redis.exceptions import ConnectionError as RedisConnectionError
 from sqlalchemy import create_engine
 
 from app.api.main import create_app
 from app.db import Base
 from app.github_client import GitHubError
+from app.graph import build_graph
+from app.graph.checkpointer import open_checkpointer
 from app.graph.prompts import SPECIALIST_PROMPTS, TRIAGE_PROMPT, VERIFIER_PROMPT
 from fakes import by_system_prompt, scripted, tool_call
+from app.worker import WorkerSettings, enqueue_review, shutdown
 from sample_pr import PATH, PAYMENTS_PY, finding, make_pr
 
 PR_URL = "https://github.com/acme/shop/pull/7"
@@ -36,21 +44,53 @@ def db_url(tmp_path) -> str:
     return f"sqlite+aiosqlite:///{path}"  # what the async app uses
 
 
+@pytest.fixture(autouse=True)
+def quiet_arq(monkeypatch):
+    """At startup arq logs the server's INFO, a command fakeredis doesn't have."""
+
+    async def skip(*args):
+        pass
+
+    monkeypatch.setattr("arq.worker.log_redis_info", skip)
+
+
+def fake_redis() -> ArqRedis:
+    """An arq client whose connections talk to an in-memory FakeServer."""
+    return ArqRedis(connection_pool=ConnectionPool(connection_class=FakeAsyncRedisConnection, server=FakeServer()))
+
+
 @pytest.fixture
 def client(db_url):
     # `with` runs the app's startup and shutdown, and keeps one event loop for
-    # the whole test (the store's asyncio.Condition must stay on one loop).
-    with TestClient(create_app(db_url)) as client:
+    # the whole test: the worker and the SSE handlers run on it too.
+    with TestClient(create_app(db_url, fake_redis())) as client:
         yield client
 
 
-def wait_for_jobs(client) -> None:
-    """Block until every running review has finished. portal.call runs a
-    coroutine on the client's event loop, where the review tasks live.
+async def burst_worker(app) -> None:
+    """A real arq worker built from our WorkerSettings, on the app's Redis and
+    database. burst=True: run everything queued, then return instead of
+    waiting for more.
     """
-    jobs = list(client.app.state.jobs)
-    if jobs:
-        client.portal.call(asyncio.wait, jobs)
+    worker = create_worker(
+        WorkerSettings,
+        redis_pool=app.state.redis,
+        ctx={"db_url": app.state.db_url},
+        burst=True,
+        handle_signals=False,  # signal handlers only work in the main thread
+        poll_delay=0.01,  # check the queue every 10 ms instead of 0.5 s
+    )
+    await worker.async_run()
+    # async_run skips on_shutdown. (worker.close() would run it, but would
+    # also close the app's Redis client.)
+    await shutdown(worker.ctx)
+
+
+def run_worker(client) -> None:
+    """Block until the worker has run every queued review. portal.call runs a
+    coroutine on the client's event loop.
+    """
+    client.portal.call(burst_worker, client.app)
 
 
 def read_sse(client, review_id, **headers) -> list[tuple[str, str, dict]]:
@@ -84,9 +124,15 @@ def test_review_lifecycle(client, fake_llm, fake_github):
 
     resp = client.post("/reviews", json={"pr_url": PR_URL})
     assert resp.status_code == 202
-    assert resp.json()["status"] == "queued"  # the response was built before the job ran
+    assert resp.json()["status"] == "queued"
     review_id = resp.json()["id"]
-    wait_for_jobs(client)
+
+    # The API did no work: the review is a job waiting in Redis, named by its id.
+    assert client.get(f"/reviews/{review_id}").json()["status"] == "queued"
+    jobs = client.portal.call(client.app.state.redis.queued_jobs)
+    assert [(j.function, j.job_id) for j in jobs] == [("run_review", review_id)]
+
+    run_worker(client)
 
     body = client.get(f"/reviews/{review_id}").json()
     assert body["status"] == "done"
@@ -134,7 +180,7 @@ def test_github_error_marks_review_failed(client, monkeypatch):
     monkeypatch.setattr("app.graph.nodes.get_pull_request", not_found)
 
     review_id = client.post("/reviews", json={"pr_url": PR_URL}).json()["id"]
-    wait_for_jobs(client)
+    run_worker(client)
     body = client.get(f"/reviews/{review_id}").json()
 
     assert body["status"] == "failed"
@@ -145,7 +191,7 @@ def test_crash_marks_review_failed_instead_of_stuck_running(client):
     # No fakes installed: the conftest safety net raises AssertionError inside
     # the graph, standing in for any unexpected bug.
     review_id = client.post("/reviews", json={"pr_url": PR_URL}).json()["id"]
-    wait_for_jobs(client)
+    run_worker(client)
     body = client.get(f"/reviews/{review_id}").json()
 
     assert body["status"] == "failed"
@@ -156,7 +202,11 @@ def test_event_stream_tells_the_whole_story_in_order(client, fake_llm, fake_gith
     script_one_bug(fake_llm, fake_github)
     review_id = client.post("/reviews", json={"pr_url": PR_URL}).json()["id"]
 
+    # Worker in the background, stream in the foreground: the SSE handler
+    # wakes up on Redis messages while the review is still running.
+    worker = client.portal.start_task_soon(burst_worker, client.app)
     events = read_sse(client, review_id)
+    worker.result()
 
     assert [i for i, _, _ in events] == [str(n) for n in range(len(events))]
     assert [(name, data.get("node") or data.get("status")) for _, name, data in events] == [
@@ -181,6 +231,7 @@ def test_event_stream_tells_the_whole_story_in_order(client, fake_llm, fake_gith
 def test_reconnect_resumes_after_last_event_id(client, fake_llm, fake_github):
     script_one_bug(fake_llm, fake_github)
     review_id = client.post("/reviews", json={"pr_url": PR_URL}).json()["id"]
+    run_worker(client)
     everything = read_sse(client, review_id)
 
     resumed = read_sse(client, review_id, **{"Last-Event-ID": "5"})
@@ -196,6 +247,7 @@ def test_failed_review_stream_ends_with_failed(client, monkeypatch):
 
     monkeypatch.setattr("app.graph.nodes.get_pull_request", not_found)
     review_id = client.post("/reviews", json={"pr_url": PR_URL}).json()["id"]
+    run_worker(client)
 
     events = read_sse(client, review_id)
 
@@ -209,39 +261,42 @@ def test_events_for_unknown_id_is_a_404(client):
 
 def test_reviews_survive_a_restart(db_url, fake_llm, fake_github):
     script_one_bug(fake_llm, fake_github)
-    with TestClient(create_app(db_url)) as client:
+    with TestClient(create_app(db_url, fake_redis())) as client:
         review_id = client.post("/reviews", json={"pr_url": PR_URL}).json()["id"]
+        run_worker(client)
         before = read_sse(client, review_id)
 
-    # A brand-new app: nothing left in memory, only what's in the database.
-    with TestClient(create_app(db_url)) as client:
+    # A brand-new app and Redis: nothing left in memory, only what's in the database.
+    with TestClient(create_app(db_url, fake_redis())) as client:
         body = client.get(f"/reviews/{review_id}").json()
         assert body["status"] == "done"
         assert [f["line"] for f in body["findings"]] == [11]
         assert read_sse(client, review_id) == before  # the UI can replay it all
 
 
-def test_restart_resumes_an_interrupted_review(db_url, fake_llm, fake_github, monkeypatch):
+def test_worker_resumes_an_interrupted_review(db_url, fake_llm, fake_github, monkeypatch):
     script_one_bug(fake_llm, fake_github)  # scripted: each agent may answer only once
     fetches = []
     monkeypatch.setattr("app.graph.nodes.get_pull_request", lambda url: fetches.append(url) or make_pr())
 
-    with TestClient(create_app(db_url)) as client:
-        store, graph = client.app.state.store, client.app.state.graph
+    with TestClient(create_app(db_url, fake_redis())) as client:
+        store = client.app.state.store
         record = client.portal.call(store.create, PR_URL)
 
         async def crash_after_triage():
-            # Stand-in for a server killed mid-review: the record says
+            # Stand-in for a worker killed mid-review: the record says
             # "running", and the checkpoints end right after triage.
             await store.update(record.id, status="running")
-            config = {"configurable": {"thread_id": record.id}}
-            async for _ in graph.astream({"pr_url": PR_URL}, config, interrupt_after=["triage"]):
-                pass
+            async with open_checkpointer(db_url) as checkpointer:
+                graph = build_graph(checkpointer)
+                config = {"configurable": {"thread_id": record.id}}
+                async for _ in graph.astream({"pr_url": PR_URL}, config, interrupt_after=["triage"]):
+                    pass
 
         client.portal.call(crash_after_triage)
-
-    with TestClient(create_app(db_url)) as client:  # startup finds it and resumes
-        wait_for_jobs(client)
+        # Nothing was ever queued: as if Redis had lost its data too. The
+        # worker's startup finds the review in Postgres and queues it again.
+        run_worker(client)
         body = client.get(f"/reviews/{record.id}").json()
         events = read_sse(client, record.id)
 
@@ -253,3 +308,32 @@ def test_restart_resumes_an_interrupted_review(db_url, fake_llm, fake_github, mo
     # second call would have failed the review.
     assert events[0][2] == {"type": "status", "status": "running", "resumed": True}
     assert [d.get("node") for _, name, d in events if name == "node"] == ["specialist", "aggregate", "verify"]
+
+
+def test_a_finished_review_is_not_run_twice(client, fake_llm, fake_github):
+    script_one_bug(fake_llm, fake_github)  # each agent may answer only once
+    review_id = client.post("/reviews", json={"pr_url": PR_URL}).json()["id"]
+    run_worker(client)
+    before = read_sse(client, review_id)
+
+    # The same job delivered again. The job sees "done" and returns at once;
+    # running the graph again would have hit the empty scripts and failed.
+    client.portal.call(enqueue_review, client.app.state.redis, review_id)
+    run_worker(client)
+
+    assert client.get(f"/reviews/{review_id}").json()["status"] == "done"
+    assert read_sse(client, review_id) == before  # no new events
+
+
+def test_queue_down_is_a_503_and_the_review_is_failed(client, monkeypatch):
+    async def refused(*args, **kwargs):
+        raise RedisConnectionError("Connection refused")
+
+    monkeypatch.setattr(client.app.state.redis, "enqueue_job", refused)
+
+    resp = client.post("/reviews", json={"pr_url": PR_URL})
+
+    assert resp.status_code == 503
+    [record] = client.get("/reviews").json()  # saved, but not left "queued" forever
+    assert record["status"] == "failed"
+    assert record["error"] == "queue unavailable"

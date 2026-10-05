@@ -11,6 +11,10 @@ import os
 # variable that's already set. So the module-level app in app.api.main gets a
 # throwaway in-memory SQLite database, and no test can touch your Postgres.
 os.environ["DATABASE_URL"] = "sqlite+aiosqlite://"
+# Tests pass a fake Redis. If one ever forgot, this port has nothing listening:
+# a job must never reach your real Redis, where a real worker would run it
+# with real LLM calls.
+os.environ["REDIS_URL"] = "redis://localhost:1"
 
 import pytest  # noqa: E402  (the env var above must come first)
 

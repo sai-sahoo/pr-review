@@ -18,5 +18,18 @@ services:
       timeout: 3s
       retries: 15
 
+  # The job queue and the pub/sub channel for live events (Step 13).
+  # No volume on purpose: Redis only holds the to-do list, and the worker
+  # rebuilds it from Postgres at startup. Lose Redis, lose nothing.
+  redis:
+    image: redis:8
+    ports:
+      - "6380:6379" # host 6380: leaves 6379 free for a Redis installed on the machine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"] # answers PONG once it's ready
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
 volumes:
   pgdata:
