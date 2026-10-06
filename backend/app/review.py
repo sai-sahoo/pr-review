@@ -1,5 +1,6 @@
 """Review a real PR with a LangGraph:
-    fetch_pr -> triage -> specialists in parallel -> aggregate -> verify
+    fetch_pr -> triage -> specialists in parallel -> aggregate -> verify -> publish
+    (publish posts to the PR only if the GitHub App is configured and installed there)
 
 Run:  cd backend && uv run python -m app.review https://github.com/OWNER/REPO/pull/123
       add --show-graph to print the graph as a Mermaid diagram (no API calls)
@@ -29,6 +30,8 @@ def describe(node: str, update: dict) -> str:
     if node == "verify":
         checks = update["checks"]
         return f"kept {len(update['verified'])} of {len(checks)}"
+    if node == "publish":
+        return update["review_url"] or update["publish_note"]
     return ""
 
 

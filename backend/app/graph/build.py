@@ -1,13 +1,13 @@
 """Wire nodes into a graph:
 
-    START -> fetch_pr -> triage -> specialist x N (parallel) -> aggregate -> verify -> END
+    START -> fetch_pr -> triage -> specialist x N (parallel) -> aggregate -> verify -> publish -> END
                                 \\-------- (empty plan) --------/
 """
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
 
-from app.graph.nodes import aggregate, fetch_pr, route_to_specialists, specialist, triage, verify
+from app.graph.nodes import aggregate, fetch_pr, publish, route_to_specialists, specialist, triage, verify
 from app.graph.state import ReviewState
 
 
@@ -19,6 +19,7 @@ def build_graph(checkpointer: BaseCheckpointSaver | None = None):
     builder.add_node("specialist", specialist)
     builder.add_node("aggregate", aggregate)
     builder.add_node("verify", verify)
+    builder.add_node("publish", publish)
 
     builder.add_edge(START, "fetch_pr")
     builder.add_edge("fetch_pr", "triage")
@@ -28,7 +29,8 @@ def build_graph(checkpointer: BaseCheckpointSaver | None = None):
     # aggregate runs once, after every parallel specialist in the step has finished.
     builder.add_edge("specialist", "aggregate")
     builder.add_edge("aggregate", "verify")
-    builder.add_edge("verify", END)
+    builder.add_edge("verify", "publish")
+    builder.add_edge("publish", END)
 
     # compile() validates the wiring (no dangling nodes, no missing edges)
     # and returns a runnable with .invoke() / .stream().

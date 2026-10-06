@@ -9,6 +9,8 @@ reviews are in flight, and restarting it doesn't touch them.
     GET  /reviews/{id}             -> the record: queued -> running -> done | failed
     GET  /reviews                  -> all records, newest first
     GET  /reviews/{id}/events      -> live progress as Server-Sent Events
+    POST /webhooks/github          -> GitHub calls this when a PR is opened or pushed to;
+                                      same dedupe, so a redelivery never starts a second review
 
 Needs Postgres and Redis:  docker compose up -d  (from the repo root)
                            cd backend && alembic upgrade head
@@ -29,14 +31,15 @@ from typing import Annotated
 
 import httpx
 from arq import ArqRedis
-from fastapi import Depends, FastAPI, Header, HTTPException, Response
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.sse import EventSourceResponse, ServerSentEvent
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 from redis.exceptions import RedisError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.api.store import ReviewRecord, ReviewStore
+from app.api.webhooks import PullRequestEvent, verify_signature
 from app.db import database_url
 from app.github_client import GitHubError, get_pr_head, parse_pr_url
 from app.worker import enqueue_review, redis_url
@@ -53,13 +56,20 @@ class ReviewRequest(BaseModel):
     pr_url: str
 
 
-def create_app(db_url: str | None = None, redis: ArqRedis | None = None) -> FastAPI:
-    """Build an app on the given database (default: DATABASE_URL) and Redis
-    (default: REDIS_URL).
+def create_app(
+    db_url: str | None = None,
+    redis: ArqRedis | None = None,
+    webhook_secret: str | None = None,
+) -> FastAPI:
+    """Build an app on the given database (default: DATABASE_URL), Redis
+    (default: REDIS_URL) and webhook secret (default: GITHUB_WEBHOOK_SECRET).
 
     Tests pass a throwaway SQLite file and an in-memory fake Redis, so each
     test starts clean.
     """
+    # The same string you type into the GitHub App's webhook settings. Empty
+    # means webhooks are off: we never accept an unsigned delivery.
+    webhook_secret = webhook_secret or os.getenv("GITHUB_WEBHOOK_SECRET", "")
     # The engine opens connections lazily and keeps them in a pool for reuse.
     # Creating it here doesn't connect yet; the first query does.
     db_url = db_url or database_url()
@@ -91,6 +101,30 @@ def create_app(db_url: str | None = None, redis: ArqRedis | None = None) -> Fast
         allow_methods=["GET", "POST"],
         allow_headers=["*"],
     )
+
+    async def start_review(pr_url: str, head_sha: str) -> tuple[ReviewRecord, bool]:
+        """(record, created). The live review of this PR at this commit, or a
+        new one, already queued. Both entry points use it: the UI's POST and
+        GitHub's webhook.
+        """
+        record, created = await store.get_or_create(pr_url, head_sha)
+        if not created:
+            return record, False
+        # Order matters: the row is committed before the job exists, so a
+        # worker that picks the job up a millisecond later finds the record.
+        try:
+            await enqueue_review(redis, record.id)
+        except RedisError:
+            # Two systems, no shared transaction: the row is saved but the job
+            # isn't. Say so, instead of leaving a review "queued" forever.
+            # "failed" also takes it out of the unique index, so a retry can
+            # create a fresh review for this commit.
+            log.exception("could not queue review %s", record.id)
+            await store.update(record.id, status="failed", error="queue unavailable",
+                               finished_at=datetime.now(UTC))
+            raise HTTPException(status_code=503, detail="review queue unavailable, try again shortly")
+        return record, True
+
     @app.post("/reviews", status_code=202, response_model=ReviewRecord)
     async def create_review(body: ReviewRequest, response: Response) -> ReviewRecord:
         # Reject a bad URL now, while the caller is still waiting for an answer.
@@ -107,28 +141,58 @@ def create_app(db_url: str | None = None, redis: ArqRedis | None = None) -> Fast
             log.exception("GitHub lookup failed for %s", body.pr_url)
             raise HTTPException(status_code=502, detail="could not reach GitHub, try again shortly")
 
-        record, created = await store.get_or_create(pr_url, head_sha)
+        record, created = await start_review(pr_url, head_sha)
         if not created:
             # Same PR, same commit: the code hasn't changed, so neither would
             # the review. Hand back the one we have (queued, running or done)
             # instead of paying for the LLM calls again. 200, not 202: no new work.
             response.status_code = 200
-            return record
-
-        # Order matters: the row is committed before the job exists, so a
-        # worker that picks the job up a millisecond later finds the record.
-        try:
-            await enqueue_review(redis, record.id)
-        except RedisError:
-            # Two systems, no shared transaction: the row is saved but the job
-            # isn't. Say so, instead of leaving a review "queued" forever.
-            # "failed" also takes it out of the unique index, so a retry can
-            # create a fresh review for this commit.
-            log.exception("could not queue review %s", record.id)
-            await store.update(record.id, status="failed", error="queue unavailable",
-                               finished_at=datetime.now(UTC))
-            raise HTTPException(status_code=503, detail="review queue unavailable, try again shortly")
         return record
+
+    @app.post("/webhooks/github")
+    async def github_webhook(
+        request: Request,
+        response: Response,
+        # FastAPI maps x_hub_signature_256 to the header X-Hub-Signature-256.
+        # All optional, so a request without them reaches the signature check
+        # and gets a 401, not a validation error.
+        x_hub_signature_256: Annotated[str | None, Header()] = None,
+        x_github_event: Annotated[str, Header()] = "",
+        x_github_delivery: Annotated[str, Header()] = "",  # a unique id per delivery, for the logs
+    ) -> dict:
+        if not webhook_secret:
+            raise HTTPException(status_code=503, detail="webhooks are off: set GITHUB_WEBHOOK_SECRET")
+        # The raw bytes, exactly as sent. GitHub signed these bytes; JSON
+        # parsed and dumped again could differ by a space and fail the check.
+        body = await request.body()
+        if not verify_signature(webhook_secret, body, x_hub_signature_256):
+            log.warning("webhook %s: bad signature", x_github_delivery)
+            raise HTTPException(status_code=401, detail="bad signature")
+
+        # GitHub sends "ping" once, when the webhook is set up. Answering 2xx
+        # shows a green tick in the App's Advanced -> Recent Deliveries.
+        if x_github_event == "ping":
+            return {"ok": "pong"}
+        # Ignored events still get a 2xx: we received them fine, there's just
+        # nothing to do. A 4xx/5xx would show up as a failed delivery.
+        if x_github_event != "pull_request":
+            return {"ignored": f"event {x_github_event!r}"}
+        try:
+            event = PullRequestEvent.model_validate_json(body)
+        except ValidationError:  # signed by GitHub, but not the shape we expect
+            raise HTTPException(status_code=422, detail="unexpected pull_request payload")
+        if reason := event.skip_reason():
+            return {"ignored": reason}
+
+        # No GitHub API call needed: the payload already has the canonical URL
+        # and the head commit. GitHub waits at most 10 s for our answer, and
+        # we only insert a row and queue a job, so we answer in milliseconds.
+        pr = event.pull_request
+        record, created = await start_review(pr.html_url, pr.head.sha)
+        log.info("webhook %s: %s %s -> review %s (%s)", x_github_delivery, event.action,
+                 pr.html_url, record.id, "new" if created else "existing")
+        response.status_code = 202 if created else 200
+        return {"review_id": record.id, "created": created}
 
     async def existing_review(review_id: str) -> ReviewRecord:
         """Dependency: the record for the path's review_id, or a 404."""

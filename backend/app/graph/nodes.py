@@ -4,18 +4,25 @@ Nodes don't know about each other or about edges. The wiring lives in
 build.py, which is why the same `specialist` node can run three times at once.
 """
 
+import logging
+
+import httpx
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.config import get_stream_writer
 from langgraph.types import Send
 
 from app.diff import number_hunk
-from app.github_client import get_pull_request
+from app import github_app
+from app.github_app import installation_token
+from app.github_client import GitHubError, get_pull_request, post_review, review_payload
 from app.graph.agent import run_specialist
 from app.graph.prompts import TRIAGE_PROMPT
 from app.graph.state import ReviewState, SpecialistInput
 from app.graph.verifier import verify_findings
 from app.llm import get_model
 from app.schemas import SEVERITY_RANK, Finding, PullRequest, TriagePlan
+
+log = logging.getLogger(__name__)
 
 MAX_DESCRIPTION_CHARS = 2000  # PR bodies can be huge templates; the diff matters more
 
@@ -94,3 +101,27 @@ def verify(state: ReviewState) -> dict:
     checks = verify_findings(pr, state["findings"], format_pr(pr))
     # Filtering keeps aggregate's severity order, so no re-sort needed.
     return {"checks": checks, "verified": [c.finding for c in checks if c.kept]}
+
+
+def publish(state: ReviewState) -> dict:
+    """Post the verified findings to the PR as one review, as the GitHub App.
+
+    A node rather than a step after the graph, for the checkpointer: once
+    publish has finished, a resumed run never reaches it again, so a worker
+    restart can't post the same review twice.
+
+    Never fails the review: the findings are already good, and they're saved
+    either way. Whatever happens ends up in publish_note.
+    """
+    pr = state["pr"]
+    if not github_app.configured():
+        return {"review_url": None, "publish_note": "not posted: no GitHub App configured"}
+    try:
+        token = installation_token(pr.owner, pr.repo)
+        if token is None:
+            return {"review_url": None, "publish_note": f"not posted: the App isn't installed on {pr.owner}/{pr.repo}"}
+        url = post_review(pr, review_payload(pr, state["verified"]), token)
+    except (GitHubError, httpx.HTTPError, OSError) as e:  # OSError: e.g. the .pem file is missing
+        log.exception("could not post the review of %s", pr.url)
+        return {"review_url": None, "publish_note": f"could not post: {e}"}
+    return {"review_url": url, "publish_note": "posted"}

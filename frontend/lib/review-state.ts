@@ -21,6 +21,7 @@ export type ReviewState = {
   agents: Record<string, AgentState>;
   rawFindings: Finding[]; // what the specialists reported, before the verifier
   checks?: FindingCheck[]; // the verifier's decision on each finding
+  published?: { url: string | null; note: string }; // posted to the PR, or why not
   error?: string;
 };
 
@@ -67,6 +68,8 @@ function applyNode(state: ReviewState, event: Extract<ReviewEvent, { type: "node
       return { ...state, rawFindings: [...state.rawFindings, ...event.findings] };
     case "verify":
       return { ...state, checks: event.checks };
+    case "publish":
+      return { ...state, published: { url: event.review_url, note: event.note } };
     default:
       return state; // aggregate: nothing new to show
   }

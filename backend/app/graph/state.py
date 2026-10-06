@@ -28,6 +28,10 @@ class ReviewState(TypedDict):
     checks: NotRequired[list[FindingCheck]]  # every finding with its verdict, kept or not
     verified: NotRequired[list[Finding]]  # only the kept ones, sorted: the final answer
 
+    # written by publish
+    review_url: NotRequired[str | None]  # the review on GitHub, or None if not posted
+    publish_note: NotRequired[str]  # what happened, in words: posted, or why not
+
 
 class SpecialistInput(TypedDict):
     """The private input one Send gives one specialist run (not the shared state)."""

@@ -15,6 +15,13 @@ os.environ["DATABASE_URL"] = "sqlite+aiosqlite://"
 # a job must never reach your real Redis, where a real worker would run it
 # with real LLM calls.
 os.environ["REDIS_URL"] = "redis://localhost:1"
+# Webhooks off unless a test passes its own secret: your real secret from
+# .env never takes part in a test.
+os.environ["GITHUB_WEBHOOK_SECRET"] = ""
+# Same for the App: the publish node sees "not configured" and posts nothing.
+# Tests that cover posting set these themselves.
+os.environ["GITHUB_APP_ID"] = ""
+os.environ["GITHUB_APP_PRIVATE_KEY_PATH"] = ""
 
 import pytest  # noqa: E402  (the env var above must come first)
 
@@ -23,7 +30,13 @@ from app.schemas import PullRequest  # noqa: E402
 from fakes import FakeChatModel, Responder  # noqa: E402
 
 LLM_SEAMS = ["app.graph.nodes.get_model", "app.graph.agent.get_model", "app.graph.verifier.get_model"]
-GITHUB_SEAMS = ["app.graph.nodes.get_pull_request", "app.graph.tools.get_file_text", "app.api.main.get_pr_head"]
+GITHUB_SEAMS = [
+    "app.graph.nodes.get_pull_request",
+    "app.graph.tools.get_file_text",
+    "app.api.main.get_pr_head",
+    "app.graph.nodes.installation_token",
+    "app.graph.nodes.post_review",
+]
 
 
 @pytest.fixture(autouse=True)

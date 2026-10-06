@@ -9,6 +9,8 @@ nothing leaks between tests. The tables come from Base.metadata.create_all,
 the quick way; the real database gets them from Alembic migrations.
 """
 
+import hashlib
+import hmac
 import json
 
 import pytest
@@ -34,6 +36,7 @@ from sample_pr import PATH, PAYMENTS_PY, finding, make_pr
 
 PR_URL = "https://github.com/acme/shop/pull/7"
 SHA = "a" * 40
+SECRET = "test-webhook-secret"
 
 
 @pytest.fixture
@@ -76,7 +79,7 @@ def fake_redis() -> ArqRedis:
 def client(db_url):
     # `with` runs the app's startup and shutdown, and keeps one event loop for
     # the whole test: the worker and the SSE handlers run on it too.
-    with TestClient(create_app(db_url, fake_redis())) as client:
+    with TestClient(create_app(db_url, fake_redis(), webhook_secret=SECRET)) as client:
         yield client
 
 
@@ -231,6 +234,7 @@ def test_event_stream_tells_the_whole_story_in_order(client, fake_llm, fake_gith
         ("node", "specialist"),
         ("node", "aggregate"),
         ("node", "verify"),
+        ("node", "publish"),
         ("done", None),
     ]
     data = [d for _, _, d in events]
@@ -238,6 +242,8 @@ def test_event_stream_tells_the_whole_story_in_order(client, fake_llm, fake_gith
                        "args": {"path": PATH, "start_line": 1, "end_line": 20}}
     assert data[4] == {"type": "agent", "agent": "correctness", "submitted": 1}
     assert [f["line"] for f in data[5]["findings"]] == [11]
+    assert data[8] == {"type": "node", "node": "publish", "review_url": None,
+                       "note": "not posted: no GitHub App configured"}
     assert data[-1] == {"type": "done", "kept": 1}
 
 
@@ -320,7 +326,8 @@ def test_worker_resumes_an_interrupted_review(db_url, fake_llm, fake_github, mon
     # Triage didn't run again either: its script had only one answer, so a
     # second call would have failed the review.
     assert events[0][2] == {"type": "status", "status": "running", "resumed": True}
-    assert [d.get("node") for _, name, d in events if name == "node"] == ["specialist", "aggregate", "verify"]
+    assert [d.get("node") for _, name, d in events if name == "node"] == [
+        "specialist", "aggregate", "verify", "publish"]
 
 
 def test_a_finished_review_is_not_run_twice(client, fake_llm, fake_github):
@@ -452,3 +459,118 @@ def test_losing_the_race_returns_the_winner(client, monkeypatch):
 
     assert (record.id, created) == (winner.id, False)
     assert len(calls) == 2
+
+
+# --- GitHub webhook --------------------------------------------------------
+
+
+def pr_event(action="opened", sha=SHA, draft=False) -> dict:
+    """The few fields of a pull_request payload we read (the real one has hundreds)."""
+    return {"action": action, "pull_request": {"html_url": PR_URL, "draft": draft, "head": {"sha": sha}}}
+
+
+def deliver(client, payload: dict, event="pull_request", secret=SECRET, signature=None):
+    """POST the way GitHub does: JSON body, event name, and the HMAC of the exact bytes."""
+    body = json.dumps(payload).encode()
+    if signature is None:
+        signature = "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+    return client.post("/webhooks/github", content=body, headers={
+        "Content-Type": "application/json",
+        "X-GitHub-Event": event,
+        "X-GitHub-Delivery": "d-1",
+        "X-Hub-Signature-256": signature,
+    })
+
+
+def test_opened_pr_queues_a_review_without_asking_github(client, monkeypatch):
+    def refuse(url):
+        raise AssertionError("the payload already has the head sha")
+
+    monkeypatch.setattr("app.api.main.get_pr_head", refuse)
+
+    resp = deliver(client, pr_event(sha="c" * 40))
+
+    assert resp.status_code == 202
+    [record] = client.get("/reviews").json()
+    assert resp.json() == {"review_id": record["id"], "created": True}
+    assert (record["pr_url"], record["head_sha"], record["status"]) == (PR_URL, "c" * 40, "queued")
+    jobs = client.portal.call(client.app.state.redis.queued_jobs)
+    assert [j.job_id for j in jobs] == [record["id"]]
+
+
+@pytest.mark.parametrize("signature", [
+    "",  # missing
+    "sha256=" + "0" * 64,  # well-formed, wrong
+    "sha256=café".encode(),  # raw non-ASCII bytes; must be a 401, not a crash
+])
+def test_bad_signature_is_a_401(client, signature):
+    resp = deliver(client, pr_event(), signature=signature)
+
+    assert resp.status_code == 401
+    assert client.get("/reviews").json() == []
+
+
+def test_signed_with_another_secret_is_a_401(client):
+    assert deliver(client, pr_event(), secret="guessed").status_code == 401
+
+
+def test_one_changed_byte_breaks_the_signature(client):
+    body = json.dumps(pr_event()).encode()
+    signature = "sha256=" + hmac.new(SECRET.encode(), body, hashlib.sha256).hexdigest()
+    tampered = body.replace(SHA.encode(), b"b" * 40)  # someone edits the payload in transit
+
+    resp = client.post("/webhooks/github", content=tampered, headers={
+        "X-GitHub-Event": "pull_request", "X-Hub-Signature-256": signature})
+
+    assert resp.status_code == 401
+
+
+def test_redelivery_returns_the_same_review(client):
+    first = deliver(client, pr_event())
+    again = deliver(client, pr_event())  # GitHub retried, or you clicked "Redeliver"
+    from_ui = client.post("/reviews", json={"pr_url": PR_URL})  # and someone pasted the URL
+
+    assert (first.status_code, again.status_code, from_ui.status_code) == (202, 200, 200)
+    assert again.json()["review_id"] == first.json()["review_id"] == from_ui.json()["id"]
+    assert len(client.get("/reviews").json()) == 1
+
+
+def test_push_to_the_pr_starts_a_new_review(client):
+    first = deliver(client, pr_event()).json()["review_id"]
+
+    resp = deliver(client, pr_event(action="synchronize", sha="b" * 40))
+
+    assert resp.status_code == 202
+    assert resp.json()["review_id"] != first
+
+
+@pytest.mark.parametrize(("event", "payload", "reason"), [
+    ("ping", {"zen": "Keep it logically awesome."}, None),
+    ("issues", {"action": "opened"}, "event 'issues'"),
+    ("pull_request", pr_event(action="closed"), "action 'closed'"),
+    ("pull_request", pr_event(action="labeled"), "action 'labeled'"),
+    ("pull_request", pr_event(draft=True), "draft PR"),
+])
+def test_other_deliveries_are_acknowledged_and_ignored(client, event, payload, reason):
+    resp = deliver(client, payload, event=event)
+
+    assert resp.status_code == 200  # a 2xx, so GitHub doesn't mark it failed
+    assert resp.json() == ({"ok": "pong"} if reason is None else {"ignored": reason})
+    assert client.get("/reviews").json() == []
+
+
+def test_draft_marked_ready_starts_a_review(client):
+    assert deliver(client, pr_event(action="ready_for_review")).status_code == 202
+
+
+def test_signed_but_unexpected_payload_is_a_422(client):
+    assert deliver(client, {"action": "opened"}).status_code == 422
+
+
+def test_webhooks_are_off_without_a_secret(db_url):
+    # conftest sets GITHUB_WEBHOOK_SECRET to "": an app without a secret
+    # refuses every delivery, instead of trusting unsigned ones.
+    with TestClient(create_app(db_url, fake_redis())) as client:
+        resp = deliver(client, pr_event(), secret="")
+
+    assert resp.status_code == 503

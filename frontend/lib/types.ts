@@ -36,6 +36,7 @@ export type ReviewEvent =
   | { type: "node"; node: "specialist"; findings: Finding[]; log: string[] }
   | { type: "node"; node: "aggregate"; count: number }
   | { type: "node"; node: "verify"; kept: number; checks: FindingCheck[] }
+  | { type: "node"; node: "publish"; review_url: string | null; note: string }
   | { type: "agent"; agent: string; tool: string; args: Record<string, unknown> }
   | { type: "agent"; agent: string; submitted: number }
   | { type: "done"; kept: number }

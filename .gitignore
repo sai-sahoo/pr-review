@@ -1,5 +1,6 @@
 # secrets
 .env
+*.pem
 # python
 .venv/
 __pycache__/

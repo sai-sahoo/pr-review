@@ -36,6 +36,8 @@ def node_event(node: str, update: dict) -> dict[str, Any]:
             "kept": len(update["verified"]),
             "checks": [c.model_dump(mode="json") for c in update["checks"]],
         }
+    elif node == "publish":
+        event |= {"review_url": update["review_url"], "note": update["publish_note"]}
     return event
 
 

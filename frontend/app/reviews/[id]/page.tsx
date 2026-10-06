@@ -32,6 +32,17 @@ export default function ReviewPage() {
         )}
       </p>
       {review.error && <p className="error">{review.error}</p>}
+      {review.published && (
+        <p className="muted">
+          {review.published.url ? (
+            <a href={review.published.url} target="_blank" rel="noreferrer">
+              View the review on GitHub →
+            </a>
+          ) : (
+            review.published.note
+          )}
+        </p>
+      )}
 
       {plan && (
         <section>
