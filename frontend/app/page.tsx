@@ -28,7 +28,7 @@ export default function HomePage() {
         setError(typeof body.detail === "string" ? body.detail : "Please enter a PR URL.");
         return;
       }
-      router.push(`/reviews/${body.id}`); // 202: the review is queued, go watch it
+      router.push(`/reviews/${body.id}`); // 202 new, or 200 an existing review of this commit: go watch it
     } catch {
       setError("Could not reach the API. Is the backend running?");
     } finally {

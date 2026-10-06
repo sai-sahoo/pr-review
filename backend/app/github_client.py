@@ -56,6 +56,19 @@ def _get(
     return resp
 
 
+def get_pr_head(url: str) -> tuple[str, str]:
+    """(canonical PR URL, head commit sha): one small request, no diff.
+
+    The canonical URL is GitHub's own html_url, the same string a webhook
+    sends. So '.../pull/7/files' typed into the UI and the webhook's URL
+    become one key, and the dedupe check sees them as the same PR.
+    """
+    owner, repo, number = parse_pr_url(url)
+    with _client() as client:
+        meta = _get(client, f"/repos/{owner}/{repo}/pulls/{number}", "application/vnd.github+json").json()
+    return meta["html_url"], meta["head"]["sha"]
+
+
 def get_pull_request(url: str, token_budget: int = DEFAULT_TOKEN_BUDGET) -> PullRequest:
     """Fetch a PR, drop noise, fit it into the budget, return one typed object."""
     owner, repo, number = parse_pr_url(url)

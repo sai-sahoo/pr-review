@@ -4,7 +4,8 @@ The API never runs a review itself. POST puts a job on the Redis queue, and a
 worker process (app/worker.py) runs it. The API stays fast however many
 reviews are in flight, and restarting it doesn't touch them.
 
-    POST /reviews {"pr_url": ...}  -> 202 + a queued record (returns at once)
+    POST /reviews {"pr_url": ...}  -> 202 + a queued record (returns at once),
+                                      or 200 + the existing review of that PR at that commit
     GET  /reviews/{id}             -> the record: queued -> running -> done | failed
     GET  /reviews                  -> all records, newest first
     GET  /reviews/{id}/events      -> live progress as Server-Sent Events
@@ -18,6 +19,7 @@ Run:  cd backend && uv run uvicorn app.api.main:app --reload
       watch a review live:  curl -N localhost:8000/reviews/<id>/events
 """
 
+import asyncio
 import logging
 import os
 from collections.abc import AsyncIterator
@@ -25,8 +27,9 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from typing import Annotated
 
+import httpx
 from arq import ArqRedis
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.sse import EventSourceResponse, ServerSentEvent
 from pydantic import BaseModel
@@ -35,7 +38,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.api.store import ReviewRecord, ReviewStore
 from app.db import database_url
-from app.github_client import GitHubError, parse_pr_url
+from app.github_client import GitHubError, get_pr_head, parse_pr_url
 from app.worker import enqueue_review, redis_url
 
 log = logging.getLogger(__name__)
@@ -89,20 +92,38 @@ def create_app(db_url: str | None = None, redis: ArqRedis | None = None) -> Fast
         allow_headers=["*"],
     )
     @app.post("/reviews", status_code=202, response_model=ReviewRecord)
-    async def create_review(body: ReviewRequest) -> ReviewRecord:
+    async def create_review(body: ReviewRequest, response: Response) -> ReviewRecord:
         # Reject a bad URL now, while the caller is still waiting for an answer.
         try:
             parse_pr_url(body.pr_url)
-        except GitHubError as e:
+            # The dedupe key needs the PR's current head commit: one small
+            # GitHub request. httpx here is the sync client, so run it in a
+            # thread; called directly, it would freeze the event loop (every
+            # other request, every SSE stream) while GitHub answers.
+            pr_url, head_sha = await asyncio.to_thread(get_pr_head, body.pr_url)
+        except GitHubError as e:  # bad URL, PR not found, rate limit: the user can act on it
             raise HTTPException(status_code=422, detail=str(e))
+        except httpx.HTTPError:
+            log.exception("GitHub lookup failed for %s", body.pr_url)
+            raise HTTPException(status_code=502, detail="could not reach GitHub, try again shortly")
+
+        record, created = await store.get_or_create(pr_url, head_sha)
+        if not created:
+            # Same PR, same commit: the code hasn't changed, so neither would
+            # the review. Hand back the one we have (queued, running or done)
+            # instead of paying for the LLM calls again. 200, not 202: no new work.
+            response.status_code = 200
+            return record
+
         # Order matters: the row is committed before the job exists, so a
         # worker that picks the job up a millisecond later finds the record.
-        record = await store.create(body.pr_url.strip())
         try:
             await enqueue_review(redis, record.id)
         except RedisError:
             # Two systems, no shared transaction: the row is saved but the job
             # isn't. Say so, instead of leaving a review "queued" forever.
+            # "failed" also takes it out of the unique index, so a retry can
+            # create a fresh review for this commit.
             log.exception("could not queue review %s", record.id)
             await store.update(record.id, status="failed", error="queue unavailable",
                                finished_at=datetime.now(UTC))

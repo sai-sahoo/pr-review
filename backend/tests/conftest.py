@@ -23,7 +23,7 @@ from app.schemas import PullRequest  # noqa: E402
 from fakes import FakeChatModel, Responder  # noqa: E402
 
 LLM_SEAMS = ["app.graph.nodes.get_model", "app.graph.agent.get_model", "app.graph.verifier.get_model"]
-GITHUB_SEAMS = ["app.graph.nodes.get_pull_request", "app.graph.tools.get_file_text"]
+GITHUB_SEAMS = ["app.graph.nodes.get_pull_request", "app.graph.tools.get_file_text", "app.api.main.get_pr_head"]
 
 
 @pytest.fixture(autouse=True)

@@ -12,7 +12,7 @@ import os
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import JSON, DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy import JSON, DateTime, ForeignKey, Index, Integer, String, Text, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -39,6 +39,21 @@ class ReviewRow(Base):
     findings: Mapped[list[dict[str, Any]]] = mapped_column(Json, default=list)
     checks: Mapped[list[dict[str, Any]]] = mapped_column(Json, default=list)
     error: Mapped[str | None] = mapped_column(Text)
+    # The commit this review is for. NULL on reviews made before Step 14a.
+    head_sha: Mapped[str | None] = mapped_column(String(40))
+
+    # At most one *live* review per (PR, commit). A partial index only covers
+    # the rows matching its WHERE, so a failed review drops out of it and the
+    # same commit can be reviewed again. The database enforces this, not our
+    # Python check: two requests racing past the check can't both insert.
+    # NULLs never collide in a unique index, so old rows don't get in the way.
+    __table_args__ = (
+        Index(
+            "uq_reviews_live_pr_sha", "pr_url", "head_sha", unique=True,
+            postgresql_where=text("status <> 'failed'"),
+            sqlite_where=text("status <> 'failed'"),  # tests run on SQLite, which has them too
+        ),
+    )
 
 
 class EventRow(Base):

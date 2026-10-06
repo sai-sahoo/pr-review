@@ -17,6 +17,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 from redis.asyncio import Redis
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.api.events import TERMINAL
@@ -41,6 +42,7 @@ class ReviewRecord(BaseModel):
 
     id: str = Field(default_factory=lambda: uuid.uuid4().hex[:12])
     pr_url: str
+    head_sha: str | None = None  # the commit under review (None: from before Step 14a)
     status: Status = "queued"
     created_at: datetime = Field(default_factory=_now)
     finished_at: datetime | None = None
@@ -78,12 +80,41 @@ class ReviewStore:
         self._sessions = sessions
         self._redis = redis
 
-    async def create(self, pr_url: str) -> ReviewRecord:
-        record = ReviewRecord(pr_url=pr_url)
+    async def create(self, pr_url: str, head_sha: str | None = None) -> ReviewRecord:
+        record = ReviewRecord(pr_url=pr_url, head_sha=head_sha)
         # .begin(): COMMIT at the end of the block, or ROLLBACK if it raises.
         async with self._sessions.begin() as session:
             session.add(ReviewRow(**_to_columns(record)))
         return record
+
+    async def find_live(self, pr_url: str, head_sha: str) -> ReviewRecord | None:
+        """The queued, running or done review of this PR at this commit, if any."""
+        async with self._sessions() as session:
+            row = await session.scalar(
+                select(ReviewRow).where(
+                    ReviewRow.pr_url == pr_url,
+                    ReviewRow.head_sha == head_sha,
+                    ReviewRow.status != "failed",  # the same filter as the partial index
+                )
+            )
+        return _to_record(row) if row else None
+
+    async def get_or_create(self, pr_url: str, head_sha: str) -> tuple[ReviewRecord, bool]:
+        """(record, created). The existing live review of this PR+commit, or a new one.
+
+        The SELECT is the fast path. The unique index is the real guard: if
+        another request inserts the same key between our SELECT and INSERT,
+        our INSERT fails with IntegrityError, and we return the winner's row.
+        """
+        if existing := await self.find_live(pr_url, head_sha):
+            return existing, False
+        try:
+            return await self.create(pr_url, head_sha), True
+        except IntegrityError:
+            existing = await self.find_live(pr_url, head_sha)
+            if existing is None:  # the winner failed in those few ms; rare, let the caller retry
+                raise
+            return existing, False
 
     async def get(self, review_id: str) -> ReviewRecord | None:
         async with self._sessions() as session:

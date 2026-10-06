@@ -20,6 +20,7 @@ from fastapi.testclient import TestClient
 from redis.asyncio import ConnectionPool
 from redis.exceptions import ConnectionError as RedisConnectionError
 from sqlalchemy import create_engine
+from sqlalchemy.exc import IntegrityError
 
 from app.api.main import create_app
 from app.db import Base
@@ -32,6 +33,7 @@ from app.worker import WorkerSettings, enqueue_review, shutdown
 from sample_pr import PATH, PAYMENTS_PY, finding, make_pr
 
 PR_URL = "https://github.com/acme/shop/pull/7"
+SHA = "a" * 40
 
 
 @pytest.fixture
@@ -52,6 +54,17 @@ def quiet_arq(monkeypatch):
         pass
 
     monkeypatch.setattr("arq.worker.log_redis_info", skip)
+
+
+@pytest.fixture(autouse=True)
+def pr_head(monkeypatch):
+    """POST asks GitHub for the PR's head commit. By default every PR is at
+    SHA, under its canonical URL. A test moves the PR to a new commit with
+    pr_head["sha"] = "...".
+    """
+    head = {"sha": SHA}
+    monkeypatch.setattr("app.api.main.get_pr_head", lambda url: (PR_URL, head["sha"]))
+    return head
 
 
 def fake_redis() -> ArqRedis:
@@ -337,3 +350,105 @@ def test_queue_down_is_a_503_and_the_review_is_failed(client, monkeypatch):
     [record] = client.get("/reviews").json()  # saved, but not left "queued" forever
     assert record["status"] == "failed"
     assert record["error"] == "queue unavailable"
+
+
+# --- dedupe by (PR, head commit) -----------------------------------------
+
+
+def test_same_pr_and_commit_returns_the_existing_review(client):
+    first = client.post("/reviews", json={"pr_url": PR_URL})
+    # Another spelling of the same PR: the canonical URL from GitHub makes them one key.
+    again = client.post("/reviews", json={"pr_url": PR_URL + "/files"})
+
+    assert first.status_code == 202
+    assert again.status_code == 200  # nothing new to do
+    assert again.json()["id"] == first.json()["id"]
+    assert first.json()["head_sha"] == SHA
+    assert len(client.get("/reviews").json()) == 1
+    jobs = client.portal.call(client.app.state.redis.queued_jobs)
+    assert len(jobs) == 1  # and only one job: no second LLM bill
+
+
+def test_done_review_is_returned_too(client, fake_llm, fake_github):
+    script_one_bug(fake_llm, fake_github)  # scripted: each agent may answer only once
+    review_id = client.post("/reviews", json={"pr_url": PR_URL}).json()["id"]
+    run_worker(client)
+
+    resp = client.post("/reviews", json={"pr_url": PR_URL})
+
+    assert resp.status_code == 200
+    assert resp.json()["id"] == review_id
+    assert resp.json()["status"] == "done"
+    assert [f["line"] for f in resp.json()["findings"]] == [11]
+
+
+def test_a_new_commit_gets_a_new_review(client, pr_head):
+    first = client.post("/reviews", json={"pr_url": PR_URL}).json()
+    pr_head["sha"] = "b" * 40  # someone pushed to the PR
+
+    second = client.post("/reviews", json={"pr_url": PR_URL})
+
+    assert second.status_code == 202
+    assert second.json()["id"] != first["id"]
+    assert second.json()["head_sha"] == "b" * 40
+
+
+def test_a_failed_review_can_be_retried(client, monkeypatch):
+    def not_found(url):
+        raise GitHubError("PR not found.")
+
+    monkeypatch.setattr("app.graph.nodes.get_pull_request", not_found)
+    failed_id = client.post("/reviews", json={"pr_url": PR_URL}).json()["id"]
+    run_worker(client)
+    assert client.get(f"/reviews/{failed_id}").json()["status"] == "failed"
+
+    retry = client.post("/reviews", json={"pr_url": PR_URL})
+
+    assert retry.status_code == 202
+    assert retry.json()["id"] != failed_id
+
+
+def test_unknown_pr_is_rejected_before_anything_is_saved(client, monkeypatch):
+    def not_found(url):
+        raise GitHubError("PR not found. Check the URL; private repos need GITHUB_TOKEN.")
+
+    monkeypatch.setattr("app.api.main.get_pr_head", not_found)
+
+    resp = client.post("/reviews", json={"pr_url": PR_URL})
+
+    assert resp.status_code == 422
+    assert resp.json()["detail"].startswith("PR not found.")
+    assert client.get("/reviews").json() == []
+
+
+def test_database_rejects_a_second_live_review_of_one_commit(client):
+    store = client.app.state.store
+    first = client.portal.call(store.create, PR_URL, SHA)
+
+    # Bypassing get_or_create, as a racing request would: the index says no.
+    with pytest.raises(IntegrityError):
+        client.portal.call(store.create, PR_URL, SHA)
+
+    # Once the first one has failed, it no longer counts.
+    client.portal.call(lambda: store.update(first.id, status="failed"))
+    client.portal.call(store.create, PR_URL, SHA)
+
+
+def test_losing_the_race_returns_the_winner(client, monkeypatch):
+    store = client.app.state.store
+    winner = client.portal.call(store.create, PR_URL, SHA)
+    # Pretend the winner's INSERT landed just after our SELECT: the first
+    # lookup sees nothing, so we try to insert and hit the unique index.
+    real_find = store.find_live
+    calls = []
+
+    async def find_live_late(*args):
+        calls.append(args)
+        return None if len(calls) == 1 else await real_find(*args)
+
+    monkeypatch.setattr(store, "find_live", find_live_late)
+
+    record, created = client.portal.call(store.get_or_create, PR_URL, SHA)
+
+    assert (record.id, created) == (winner.id, False)
+    assert len(calls) == 2
