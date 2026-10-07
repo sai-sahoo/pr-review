@@ -4,8 +4,9 @@ Same PR endpoint, two representations, chosen by the Accept header:
   application/vnd.github+json  -> PR metadata (title, branches, head sha)
   application/vnd.github.diff  -> the raw unified diff as plain text
 
-And one write: post_review, which needs the App's installation token
-(app/github_app.py) instead of GITHUB_TOKEN.
+Reads go out as the GitHub App when it's installed on the repo, and with
+GITHUB_TOKEN (or anonymously) otherwise. The one write, post_review, always
+needs the App's installation token (app/github_app.py).
 """
 
 import os
@@ -34,10 +35,28 @@ def parse_pr_url(url: str) -> tuple[str, str, int]:
     return owner, repo, int(number)
 
 
-def _client() -> httpx.Client:
+def read_token(owner: str, repo: str) -> str | None:
+    """Who we read owner/repo as.
+
+    The App's installation token when the App is installed there: it can
+    read the private repos it's installed on without anyone's personal
+    token, and its rate limit is the App's own, not your account's. Else
+    GITHUB_TOKEN, for any public PR pasted into the UI. Else None:
+    anonymous, 60 requests an hour.
+    """
+    # Imported here, not at the top: github_app imports this module (for API
+    # and GitHubError), and two modules importing each other at the top can
+    # find each other half-loaded.
+    from app import github_app
+
+    if github_app.configured() and (token := github_app.installation_token(owner, repo)):
+        return token
+    return os.getenv("GITHUB_TOKEN")
+
+
+def _client(owner: str, repo: str) -> httpx.Client:
     headers = {"X-GitHub-Api-Version": "2022-11-28"}
-    token = os.getenv("GITHUB_TOKEN")
-    if token:  # optional for public repos, but lifts the limit from 60 to 5000 requests/hour
+    if token := read_token(owner, repo):
         headers["Authorization"] = f"Bearer {token}"
     return httpx.Client(base_url=API, headers=headers, timeout=30)
 
@@ -46,7 +65,7 @@ def _get(
     client: httpx.Client,
     path: str,
     accept: str,
-    not_found: str = "PR not found. Check the URL; private repos need GITHUB_TOKEN.",
+    not_found: str = "PR not found. Check the URL; private repos need the App installed or GITHUB_TOKEN.",
 ) -> httpx.Response:
     resp = client.get(path, headers={"Accept": accept})
     if resp.status_code == 404:
@@ -67,7 +86,7 @@ def get_pr_head(url: str) -> tuple[str, str]:
     become one key, and the dedupe check sees them as the same PR.
     """
     owner, repo, number = parse_pr_url(url)
-    with _client() as client:
+    with _client(owner, repo) as client:
         meta = _get(client, f"/repos/{owner}/{repo}/pulls/{number}", "application/vnd.github+json").json()
     return meta["html_url"], meta["head"]["sha"]
 
@@ -77,7 +96,7 @@ def get_pull_request(url: str, token_budget: int = DEFAULT_TOKEN_BUDGET) -> Pull
     owner, repo, number = parse_pr_url(url)
     path = f"/repos/{owner}/{repo}/pulls/{number}"
 
-    with _client() as client:
+    with _client(owner, repo) as client:
         meta = _get(client, path, "application/vnd.github+json").json()
         diff_text = _get(client, path, "application/vnd.github.diff").text
 
@@ -105,7 +124,7 @@ def get_pull_request(url: str, token_budget: int = DEFAULT_TOKEN_BUDGET) -> Pull
 @lru_cache(maxsize=256)
 def get_file_text(owner: str, repo: str, sha: str, path: str) -> str:
     """Full text of one file as of a specific commit."""
-    with _client() as client:
+    with _client(owner, repo) as client:
         resp = _get(
             client,
             f"/repos/{owner}/{repo}/contents/{path}?ref={sha}",

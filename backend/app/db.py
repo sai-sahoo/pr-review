@@ -41,6 +41,9 @@ class ReviewRow(Base):
     error: Mapped[str | None] = mapped_column(Text)
     # The commit this review is for. NULL on reviews made before Step 14a.
     head_sha: Mapped[str | None] = mapped_column(String(40))
+    # A human's decision at the approval step: positions in `findings` to
+    # post. NULL until someone decides (and on reviews nobody had to approve).
+    approved: Mapped[list[int] | None] = mapped_column(Json)
 
     # At most one *live* review per (PR, commit). A partial index only covers
     # the rows matching its WHERE, so a failed review drops out of it and the

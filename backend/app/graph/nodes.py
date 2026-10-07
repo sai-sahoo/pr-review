@@ -9,7 +9,7 @@ import logging
 import httpx
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.config import get_stream_writer
-from langgraph.types import Send
+from langgraph.types import Send, interrupt
 
 from app.diff import number_hunk
 from app import github_app
@@ -103,6 +103,52 @@ def verify(state: ReviewState) -> dict:
     return {"checks": checks, "verified": [c.finding for c in checks if c.kept]}
 
 
+def can_post(pr: PullRequest) -> bool:
+    """Would publish be able to post to this PR? Only then is a human asked."""
+    if not github_app.configured():
+        return False
+    try:
+        return installation_token(pr.owner, pr.repo) is not None
+    except (GitHubError, httpx.HTTPError, OSError):
+        return False  # don't make anyone approve a post that can't happen; publish says why
+
+
+def route_after_verify(state: ReviewState) -> str:
+    """Conditional edge: ask a human only when there's something to post and
+    somewhere to post it. Otherwise straight on to publish, which explains.
+
+    Deciding here, not inside approve, matters on resume: a router's choice
+    is saved in verify's checkpoint and never re-made. approve itself runs
+    again from its first line when resumed (see below), so it must not
+    contain a check whose answer could change while it waits, like "is the
+    App still installed?".
+    """
+    if state["verified"] and can_post(state["pr"]):
+        return "approve"
+    return "publish"
+
+
+def approve(state: ReviewState) -> dict:
+    """Human in the loop: pause until someone decides which findings get posted.
+
+    The first time through, interrupt() doesn't return. It saves the run
+    (the checkpointer already holds the state) and stops the graph; the
+    value passed to it travels out to whoever is running the graph.
+
+    Later, someone runs the graph again with Command(resume=decision). The
+    node then starts *over from its first line*, and this time interrupt()
+    returns the decision instead of stopping. So anything above the
+    interrupt() runs twice: keep it cheap and give it the same answer both
+    times.
+    """
+    verified = state["verified"]
+    decision = interrupt({"findings": [f.model_dump(mode="json") for f in verified]})
+    # decision is {"approved": [0, 2]}: positions in `verified`. The API has
+    # already checked them; a set makes "is i approved?" a quick lookup.
+    keep = set(decision["approved"])
+    return {"approved": [f for i, f in enumerate(verified) if i in keep]}
+
+
 def publish(state: ReviewState) -> dict:
     """Post the verified findings to the PR as one review, as the GitHub App.
 
@@ -110,17 +156,25 @@ def publish(state: ReviewState) -> dict:
     publish has finished, a resumed run never reaches it again, so a worker
     restart can't post the same review twice.
 
+    Posts what approve let through. A human has already said yes to each
+    one when the run paused there.
+
     Never fails the review: the findings are already good, and they're saved
     either way. Whatever happens ends up in publish_note.
     """
     pr = state["pr"]
+    # What a human approved, or, when nobody was asked, everything verified.
+    findings = state.get("approved", state["verified"])
+    if state["verified"] and not findings:
+        # Not the "no issues ✅" review: that would claim the PR is clean.
+        return {"review_url": None, "publish_note": "not posted: every finding was dismissed"}
     if not github_app.configured():
         return {"review_url": None, "publish_note": "not posted: no GitHub App configured"}
     try:
         token = installation_token(pr.owner, pr.repo)
         if token is None:
             return {"review_url": None, "publish_note": f"not posted: the App isn't installed on {pr.owner}/{pr.repo}"}
-        url = post_review(pr, review_payload(pr, state["verified"]), token)
+        url = post_review(pr, review_payload(pr, findings), token)
     except (GitHubError, httpx.HTTPError, OSError) as e:  # OSError: e.g. the .pem file is missing
         log.exception("could not post the review of %s", pr.url)
         return {"review_url": None, "publish_note": f"could not post: {e}"}

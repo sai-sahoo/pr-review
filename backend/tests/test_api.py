@@ -574,3 +574,123 @@ def test_webhooks_are_off_without_a_secret(db_url):
         resp = deliver(client, pr_event(), secret="")
 
     assert resp.status_code == 503
+
+
+# --- human approval ----------------------------------------------------------
+
+
+@pytest.fixture
+def installed_app(monkeypatch):
+    """The App is configured and installed on the PR's repo, so reviews pause
+    for approval before posting. Returns the payloads that got posted.
+    """
+    monkeypatch.setenv("GITHUB_APP_ID", "1")
+    monkeypatch.setenv("GITHUB_APP_PRIVATE_KEY_PATH", "unused.pem")  # installation_token is faked
+    monkeypatch.setattr("app.graph.nodes.installation_token", lambda owner, repo: "ghs_abc")
+    posted: list[dict] = []
+    monkeypatch.setattr("app.graph.nodes.post_review",
+                        lambda pr, payload, token: posted.append(payload) or "https://github.com/r/1")
+    return posted
+
+
+def waiting_review(client, fake_llm, fake_github) -> str:
+    """A review that has run up to the approval step, with one finding (line 11)."""
+    script_one_bug(fake_llm, fake_github)
+    review_id = client.post("/reviews", json={"pr_url": PR_URL}).json()["id"]
+    run_worker(client)
+    return review_id
+
+
+def test_review_waits_for_approval_then_posts(client, fake_llm, fake_github, installed_app):
+    review_id = waiting_review(client, fake_llm, fake_github)
+
+    # The job has ended: the review is parked, with its findings ready to judge.
+    body = client.get(f"/reviews/{review_id}").json()
+    assert body["status"] == "waiting"
+    assert [f["line"] for f in body["findings"]] == [11]
+    assert installed_app == []  # nothing posted yet
+    assert client.portal.call(client.app.state.redis.queued_jobs) == []  # and no job holds a slot
+
+    resp = client.post(f"/reviews/{review_id}/approval", json={"approved": [0]})
+    assert resp.status_code == 202
+    assert (resp.json()["status"], resp.json()["approved"]) == ("queued", [0])
+
+    run_worker(client)  # the resume: scripted agents have no answers left, so none may run again
+
+    body = client.get(f"/reviews/{review_id}").json()
+    assert body["status"] == "done"
+    [payload] = installed_app
+    assert [c["line"] for c in payload["comments"]] == [11]
+    events = [(name, d.get("node") or d.get("status")) for _, name, d in read_sse(client, review_id)]
+    assert events[events.index(("node", "verify")):] == [
+        ("node", "verify"),
+        ("status", "waiting"),  # the first job ends here
+        ("status", "running"),  # the second one starts, from the checkpoint
+        ("node", "approve"),
+        ("node", "publish"),
+        ("done", None),
+    ]
+
+
+def test_dismissing_every_finding_posts_nothing(client, fake_llm, fake_github, installed_app):
+    review_id = waiting_review(client, fake_llm, fake_github)
+
+    client.post(f"/reviews/{review_id}/approval", json={"approved": []})
+    run_worker(client)
+
+    assert client.get(f"/reviews/{review_id}").json()["status"] == "done"
+    assert installed_app == []
+    publish = [d for _, _, d in read_sse(client, review_id) if d.get("node") == "publish"]
+    assert publish[0]["note"] == "not posted: every finding was dismissed"
+
+
+def test_approval_is_only_accepted_while_waiting(client):
+    queued_id = client.post("/reviews", json={"pr_url": "https://github.com/acme/other/pull/1"}).json()["id"]
+    assert client.post(f"/reviews/{queued_id}/approval", json={"approved": []}).status_code == 409
+    assert client.post("/reviews/nope/approval", json={"approved": []}).status_code == 404
+
+
+def test_approval_positions_are_checked(client, fake_llm, fake_github, installed_app):
+    review_id = waiting_review(client, fake_llm, fake_github)
+
+    resp = client.post(f"/reviews/{review_id}/approval", json={"approved": [1]})  # there's only [0]
+
+    assert resp.status_code == 422
+    assert client.get(f"/reviews/{review_id}").json()["status"] == "waiting"  # still undecided
+
+
+def test_a_second_decision_is_a_409(client, fake_llm, fake_github, installed_app):
+    review_id = waiting_review(client, fake_llm, fake_github)
+    store = client.app.state.store
+
+    assert client.portal.call(store.approve, review_id, [0]) is True
+    # A second click that got past the status check at the same moment: the
+    # conditional UPDATE matches nothing, because the status already changed.
+    assert client.portal.call(store.approve, review_id, []) is False
+    assert client.get(f"/reviews/{review_id}").json()["approved"] == [0]
+
+
+def test_a_waiting_review_is_not_started_by_a_stray_job(client, fake_llm, fake_github, installed_app):
+    review_id = waiting_review(client, fake_llm, fake_github)
+
+    client.portal.call(enqueue_review, client.app.state.redis, review_id)  # e.g. a redelivery
+    run_worker(client)
+
+    assert client.get(f"/reviews/{review_id}").json()["status"] == "waiting"
+    assert installed_app == []
+
+
+def test_queue_down_on_approval_keeps_the_review_waiting(client, fake_llm, fake_github, installed_app,
+                                                       monkeypatch):
+    review_id = waiting_review(client, fake_llm, fake_github)
+
+    async def refused(*args, **kwargs):
+        raise RedisConnectionError("Connection refused")
+
+    monkeypatch.setattr(client.app.state.redis, "enqueue_job", refused)
+
+    resp = client.post(f"/reviews/{review_id}/approval", json={"approved": [0]})
+
+    assert resp.status_code == 503
+    body = client.get(f"/reviews/{review_id}").json()
+    assert (body["status"], body["approved"]) == ("waiting", None)  # free to send it again

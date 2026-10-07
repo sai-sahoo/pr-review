@@ -17,6 +17,7 @@ from datetime import UTC, datetime
 
 from arq import ArqRedis
 from arq.connections import RedisSettings
+from langgraph.types import Command
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.api.events import agent_event, node_event
@@ -84,8 +85,9 @@ async def run_review(ctx: dict, review_id: str) -> None:
     record = await store.get(review_id)
     # Queues deliver "at least once": the same job can arrive again, e.g. the
     # startup sweep after Redis lost track of a finished job. A finished
-    # review must not be run (and paid for) twice.
-    if record is None or record.status in ("done", "failed"):
+    # review must not be run (and paid for) twice. A waiting one waits for
+    # a human: only POST /reviews/{id}/approval may send it on.
+    if record is None or record.status in ("done", "failed", "waiting"):
         return
 
     # The checkpointer files this run's state under the thread_id. The
@@ -97,7 +99,18 @@ async def run_review(ctx: dict, review_id: str) -> None:
     # start a brand-new run.
     saved = await graph.aget_state(config)
     resuming = bool(saved.values)
-    graph_input = None if resuming else {"pr_url": record.pr_url}
+    if not resuming:
+        graph_input = {"pr_url": record.pr_url}
+    elif saved.interrupts and record.approved is not None:
+        # Paused at approve, and a human has decided since: hand the decision
+        # to the interrupt() that's waiting for it. It comes from Postgres,
+        # not from the job, so a lost job or a worker restart can't lose it.
+        graph_input = Command(resume={"approved": record.approved})
+    else:
+        # Mid-run, or paused with no decision yet (the worker stopped right
+        # after the pause, before marking the review "waiting"). With None,
+        # approve runs again, interrupts again, and we mark it below.
+        graph_input = None
 
     await store.update(review_id, status="running")
     await store.add_event(review_id, {"type": "status", "status": "running", "resumed": resuming})
@@ -114,6 +127,8 @@ async def run_review(ctx: dict, review_id: str) -> None:
                     await store.add_event(review_id, agent_event(chunk))
                     continue
                 for node, update in chunk.items():
+                    if node == "__interrupt__":  # the pause; handled below, from the checkpoint
+                        continue
                     await store.add_event(review_id, node_event(node, update))
     except GitHubError as e:  # a problem the user can fix: show it as is
         await fail(store, review_id, str(e))
@@ -135,7 +150,23 @@ async def run_review(ctx: dict, review_id: str) -> None:
     # The full end state comes from the checkpoint. A resumed run only
     # streams the nodes it ran itself, so collecting the updates as they
     # arrive would miss what the earlier attempt did (fetch_pr's pr).
-    final = (await graph.aget_state(config)).values
+    snapshot = await graph.aget_state(config)
+    final = snapshot.values
+    if snapshot.interrupts:
+        # The graph stopped at approve. The job ends here: no worker slot
+        # sits idle while the human takes minutes (or days); the paused run
+        # is just a checkpoint in Postgres. The findings go into the record
+        # now, so the UI can show them for approval.
+        await store.update(
+            review_id,
+            status="waiting",
+            title=final["pr"].title,
+            findings=final["verified"],
+            checks=final["checks"],
+        )
+        await store.add_event(review_id, {"type": "status", "status": "waiting"})
+        return
+
     await store.update(
         review_id,
         status="done",

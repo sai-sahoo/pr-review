@@ -1,6 +1,7 @@
 """Review a real PR with a LangGraph:
-    fetch_pr -> triage -> specialists in parallel -> aggregate -> verify -> publish
-    (publish posts to the PR only if the GitHub App is configured and installed there)
+    fetch_pr -> triage -> specialists in parallel -> aggregate -> verify -> approve -> publish
+    (publish posts to the PR only if the GitHub App is configured and installed there,
+     and then approve first asks you, right here in the terminal, which findings to post)
 
 Run:  cd backend && uv run python -m app.review https://github.com/OWNER/REPO/pull/123
       add --show-graph to print the graph as a Mermaid diagram (no API calls)
@@ -8,6 +9,9 @@ Run:  cd backend && uv run python -m app.review https://github.com/OWNER/REPO/pu
 
 import argparse
 import time
+
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.types import Command
 
 from app.github_client import GitHubError
 from app.graph import build_graph
@@ -30,6 +34,8 @@ def describe(node: str, update: dict) -> str:
     if node == "verify":
         checks = update["checks"]
         return f"kept {len(update['verified'])} of {len(checks)}"
+    if node == "approve":
+        return f"posting {len(update['approved'])} you approved"
     if node == "publish":
         return update["review_url"] or update["publish_note"]
     return ""
@@ -39,13 +45,30 @@ def fmt_conf(confidence: float | None) -> str:
     return "unscored" if confidence is None else f"confidence {confidence:.2f}"
 
 
+def ask_approval(findings: list[dict]) -> dict:
+    """The CLI's approval screen: the interrupt's findings in, a decision out."""
+    print("\n=== Post these findings to the PR? ===")
+    for i, f in enumerate(findings, 1):  # numbered from 1 for people; positions are from 0
+        print(f"  {i}. [{f['severity'].upper()}] {f['file']}:{f['line']}  {f['title']}")
+    answer = input("Numbers to post (e.g. 1,3), 'all' or 'none' [all]: ").strip().lower()
+    if answer in ("", "all"):
+        return {"approved": list(range(len(findings)))}
+    if answer == "none":
+        return {"approved": []}
+    picked = {int(n) - 1 for n in answer.replace(",", " ").split() if n.isdigit()}
+    return {"approved": sorted(i for i in picked if 0 <= i < len(findings))}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Review a GitHub PR with an LLM.")
     parser.add_argument("pr_url", nargs="?")
     parser.add_argument("--show-graph", action="store_true", help="print the graph and exit")
     args = parser.parse_args()
 
-    graph = build_graph()
+    # interrupt() needs a checkpointer to pause into. A run of this script
+    # lives only as long as the script, so memory is enough; the worker uses Postgres.
+    graph = build_graph(InMemorySaver())
+    config = {"configurable": {"thread_id": "cli"}}
 
     if args.show_graph:
         print(graph.get_graph().draw_mermaid())  # paste into https://mermaid.live
@@ -55,14 +78,25 @@ def main() -> None:
 
     start = time.perf_counter()
     checks = []
+    graph_input: dict | Command = {"pr_url": args.pr_url}
     try:
-        # stream_mode="updates" yields {node_name: update} each time a node finishes,
-        # so we can watch the graph run. invoke() would only return the end state.
-        for chunk in graph.stream({"pr_url": args.pr_url}, stream_mode="updates"):
-            for node, update in chunk.items():
-                print(f"[{time.perf_counter() - start:5.1f}s] {node:<10} {describe(node, update)}")
-                if node == "verify":
-                    checks = update["checks"]
+        # Each pass runs the graph until it ends or pauses. A pause at approve
+        # ends the stream like a finish does; the checkpoint tells them apart.
+        while True:
+            # stream_mode="updates" yields {node_name: update} each time a node finishes,
+            # so we can watch the graph run. invoke() would only return the end state.
+            for chunk in graph.stream(graph_input, config, stream_mode="updates"):
+                for node, update in chunk.items():
+                    if node == "__interrupt__":  # the pause itself, not a node
+                        continue
+                    print(f"[{time.perf_counter() - start:5.1f}s] {node:<10} {describe(node, update)}")
+                    if node == "verify":
+                        checks = update["checks"]
+            interrupts = graph.get_state(config).interrupts
+            if not interrupts:
+                break
+            # The value approve passed to interrupt(), and our answer back to it.
+            graph_input = Command(resume=ask_approval(interrupts[0].value["findings"]))
     except GitHubError as e:  # node exceptions propagate out of the graph unchanged
         raise SystemExit(f"error: {e}")
 

@@ -14,7 +14,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 
 from app import github_app
 from app.github_app import app_jwt, installation_token
-from app.github_client import GitHubError, review_payload
+from app.github_client import GitHubError, read_token, review_payload
 from app.graph.nodes import publish
 from sample_pr import PATH, finding, make_pr
 
@@ -137,6 +137,29 @@ def test_no_findings_still_reports_back():
 
     assert payload["comments"] == []
     assert "no issues" in payload["body"]
+
+
+# --- reading PRs as the App (Step 15) -------------------------------------
+
+
+def test_reads_use_the_installation_token_where_the_app_is_installed(app_env, fake_github_api, monkeypatch):
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_personal")
+    _, replies = fake_github_api
+    replies["GET /repos/acme/shop/installation"] = httpx.Response(200, json={"id": 42})
+    replies["POST /app/installations/42/access_tokens"] = httpx.Response(
+        201, json={"token": "ghs_abc", "expires_at": "2099-01-01T00:00:00Z"})
+    replies["GET /repos/alexreardon/tiny-invariant/installation"] = httpx.Response(404)
+
+    assert read_token("acme", "shop") == "ghs_abc"  # installed: the App reads it
+    assert read_token("alexreardon", "tiny-invariant") == "ghp_personal"  # not installed: your token
+
+
+def test_reads_use_github_token_without_an_app(monkeypatch):
+    # conftest leaves the App unconfigured: no GitHub call at all, just the env.
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_personal")
+    assert read_token("acme", "shop") == "ghp_personal"
+    monkeypatch.delenv("GITHUB_TOKEN")
+    assert read_token("acme", "shop") is None  # anonymous
 
 
 # --- the publish node ------------------------------------------------------

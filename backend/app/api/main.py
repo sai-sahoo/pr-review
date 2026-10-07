@@ -9,6 +9,8 @@ reviews are in flight, and restarting it doesn't touch them.
     GET  /reviews/{id}             -> the record: queued -> running -> done | failed
     GET  /reviews                  -> all records, newest first
     GET  /reviews/{id}/events      -> live progress as Server-Sent Events
+    POST /reviews/{id}/approval    -> a human's decision on a "waiting" review: which
+       {"approved": [0, 2]}           findings to post. 202, and the worker carries on
     POST /webhooks/github          -> GitHub calls this when a PR is opened or pushed to;
                                       same dedupe, so a redelivery never starts a second review
 
@@ -54,6 +56,11 @@ FRONTEND_ORIGINS = os.getenv("FRONTEND_ORIGINS", "http://localhost:3000").split(
 
 class ReviewRequest(BaseModel):
     pr_url: str
+
+
+class ApprovalRequest(BaseModel):
+    # Positions in the review's `findings` list. [] dismisses them all.
+    approved: list[int]
 
 
 def create_app(
@@ -220,6 +227,33 @@ def create_app(
         # proxies don't close a connection that's quiet while an LLM thinks.
         async for i, event in store.follow(record.id, start):
             yield ServerSentEvent(id=str(i), event=event["type"], data=event)
+
+    @app.post("/reviews/{review_id}/approval", status_code=202, response_model=ReviewRecord)
+    async def approve_review(
+        body: ApprovalRequest,
+        record: Annotated[ReviewRecord, Depends(existing_review)],
+    ) -> ReviewRecord:
+        # 409 Conflict: the request is fine, but not in the review's current state.
+        if record.status != "waiting":
+            raise HTTPException(status_code=409, detail=f"review is {record.status}, not waiting for approval")
+        if any(not 0 <= i < len(record.findings) for i in body.approved):
+            raise HTTPException(status_code=422, detail=f"approved must be positions 0-{len(record.findings) - 1}")
+        approved = sorted(set(body.approved))  # a double click's [0, 0] is just [0]
+
+        # The status check above was a friendly early answer. This is the
+        # real one: of two racing requests, only one changes the row.
+        if not await store.approve(record.id, approved):
+            raise HTTPException(status_code=409, detail="review was already decided")
+        try:
+            await enqueue_review(redis, record.id)
+        except RedisError:
+            # The decision is saved but no job will act on it. Undo, so the
+            # human sees "waiting" again and can resend, instead of a review
+            # stuck in "queued" until a worker restarts.
+            log.exception("could not queue approved review %s", record.id)
+            await store.update(record.id, status="waiting", approved=None)
+            raise HTTPException(status_code=503, detail="review queue unavailable, try again shortly")
+        return await store.get(record.id)
 
     @app.get("/reviews", response_model=list[ReviewRecord])
     async def list_reviews() -> list[ReviewRecord]:

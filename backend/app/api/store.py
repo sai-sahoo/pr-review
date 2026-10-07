@@ -16,7 +16,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 from redis.asyncio import Redis
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
@@ -24,7 +24,9 @@ from app.api.events import TERMINAL
 from app.db import EventRow, ReviewRow
 from app.schemas import Finding, FindingCheck
 
-Status = Literal["queued", "running", "done", "failed"]
+# waiting: paused before posting, until a human approves. Not "unfinished":
+# no job exists for it, and none should be started until someone decides.
+Status = Literal["queued", "running", "waiting", "done", "failed"]
 UNFINISHED = ["queued", "running"]
 
 # Pub/sub is fire-and-forget: a message sent while nobody listens, or lost in
@@ -50,6 +52,7 @@ class ReviewRecord(BaseModel):
     findings: list[Finding] = []  # the verified ones: the final answer
     checks: list[FindingCheck] = []  # every finding with the verifier's decision
     error: str | None = None  # set when status == "failed"
+    approved: list[int] | None = None  # the findings (by position) a human chose to post
 
 
 # The API speaks ReviewRecord (Pydantic); the database speaks ReviewRow
@@ -141,6 +144,24 @@ class ReviewStore:
             for column, value in _to_columns(record).items():
                 setattr(row, column, value)
         return record
+
+    async def approve(self, review_id: str, approved: list[int]) -> bool:
+        """Record a human's decision and queue the review again. True if this
+        call did it; False if the review wasn't waiting (any more).
+
+        One UPDATE ... WHERE status = 'waiting': the database checks and
+        changes in a single step. With a get() then an update(), two clicks
+        a millisecond apart could both see "waiting" and both resume the run.
+        Here the second UPDATE matches no row, since the first already
+        changed the status.
+        """
+        async with self._sessions.begin() as session:
+            result = await session.execute(
+                update(ReviewRow)
+                .where(ReviewRow.id == review_id, ReviewRow.status == "waiting")
+                .values(status="queued", approved=approved)
+            )
+        return result.rowcount == 1
 
     # --- events ---------------------------------------------------------
 

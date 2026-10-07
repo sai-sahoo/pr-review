@@ -6,8 +6,6 @@ export const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000
 
 export type Severity = "critical" | "high" | "medium" | "low";
 
-export const SEVERITY_RANK: Record<Severity, number> = { critical: 0, high: 1, medium: 2, low: 3 };
-
 export type Finding = {
   file: string;
   line: number;
@@ -30,12 +28,13 @@ export type FindingCheck = {
 // A union with a shared `type` field lets TypeScript know which other fields
 // exist once you've checked `type` (and `node`), like a match statement.
 export type ReviewEvent =
-  | { type: "status"; status: "running" }
+  | { type: "status"; status: "running" | "waiting" } // waiting: paused for your approval
   | { type: "node"; node: "fetch_pr"; number: number; title: string; files: string[]; skipped: string[] }
   | { type: "node"; node: "triage"; specialists: string[]; reason: string }
   | { type: "node"; node: "specialist"; findings: Finding[]; log: string[] }
   | { type: "node"; node: "aggregate"; count: number }
   | { type: "node"; node: "verify"; kept: number; checks: FindingCheck[] }
+  | { type: "node"; node: "approve"; approved: number }
   | { type: "node"; node: "publish"; review_url: string | null; note: string }
   | { type: "agent"; agent: string; tool: string; args: Record<string, unknown> }
   | { type: "agent"; agent: string; submitted: number }

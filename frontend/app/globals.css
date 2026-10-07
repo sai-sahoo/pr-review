@@ -107,7 +107,11 @@ pre {
 .badge.medium { background: #b38600; }
 .badge.low { background: #5f6368; }
 .badge.status-running, .badge.status-connecting { background: #2f6fde; }
+.badge.status-waiting { background: #b06000; }
 .badge.status-done { background: #188038; }
 .badge.status-failed { background: #b3261e; }
 
 details summary { cursor: pointer; margin: 12px 0; }
+
+input[type="checkbox"] { flex: none; }
+.card.dismissed { opacity: 0.5; }
