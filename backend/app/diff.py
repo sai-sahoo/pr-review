@@ -110,6 +110,17 @@ def diff_line_numbers(hunks: list[str]) -> set[int]:
     return {n for h in hunks for n, _ in _walk_hunk(h) if n is not None}
 
 
+def line_text(hunks: list[str], line: int) -> str | None:
+    """The code on one new-file line, without its '+'/' ' prefix. None if
+    the hunks don't show that line.
+    """
+    for h in hunks:
+        for n, text in _walk_hunk(h):
+            if n == line:
+                return text[1:]
+    return None
+
+
 def apply_budget(
     files: list[ChangedFile], max_tokens: int
 ) -> tuple[list[ChangedFile], list[SkippedFile]]:

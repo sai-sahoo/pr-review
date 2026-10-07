@@ -75,7 +75,9 @@ class FindingCheck(BaseModel):
 
     finding: Finding
     kept: bool
-    stage: Literal["grounding", "verifier"]  # which check made the decision
+    # which check made the decision; "seen": already on the PR, or dismissed
+    # before (Step 15b-1)
+    stage: Literal["grounding", "verifier", "seen"]
     confidence: float | None  # verifier's score; None if it never got a score
     reason: str
 

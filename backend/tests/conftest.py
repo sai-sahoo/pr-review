@@ -25,13 +25,17 @@ os.environ["GITHUB_APP_PRIVATE_KEY_PATH"] = ""
 
 import pytest  # noqa: E402  (the env var above must come first)
 
-from app.github_client import GitHubError  # noqa: E402
+from app.github_client import GitHubError, ReviewThread  # noqa: E402
 from app.schemas import PullRequest  # noqa: E402
 from fakes import FakeChatModel, Responder  # noqa: E402
 
 LLM_SEAMS = ["app.graph.nodes.get_model", "app.graph.agent.get_model", "app.graph.verifier.get_model"]
 GITHUB_SEAMS = [
     "app.graph.nodes.get_pull_request",
+    "app.graph.nodes.get_posted_fingerprints",
+    "app.graph.nodes.get_open_bot_threads",
+    "app.graph.nodes.resolve_thread",
+    "app.graph.nodes.get_file_text",
     "app.graph.tools.get_file_text",
     "app.api.main.get_pr_head",
     "app.graph.nodes.installation_token",
@@ -68,10 +72,17 @@ def fake_llm(monkeypatch):
 
 @pytest.fixture
 def fake_github(monkeypatch):
-    """Usage: fake_github(pr, files={"path": "text"}). Unknown paths act like a 404."""
+    """Usage: resolved = fake_github(pr, files={"path": "text"}, posted={"fp"}, threads=[...]).
 
-    def install(pr: PullRequest, files: dict[str, str] | None = None) -> None:
+    Unknown paths act like a 404. `posted`: fingerprints our bot already
+    commented on the PR; `threads`: its open threads (none by default).
+    Returns the ids of the threads that got resolved.
+    """
+
+    def install(pr: PullRequest, files: dict[str, str] | None = None, posted: set[str] = frozenset(),
+                threads: list[ReviewThread] = ()) -> list[str]:
         files = files or {}
+        resolved: list[str] = []
 
         def get_file_text(owner, repo, sha, path):
             if path not in files:
@@ -79,6 +90,11 @@ def fake_github(monkeypatch):
             return files[path]
 
         monkeypatch.setattr("app.graph.nodes.get_pull_request", lambda url: pr)
+        monkeypatch.setattr("app.graph.nodes.get_posted_fingerprints", lambda pr: set(posted))
         monkeypatch.setattr("app.graph.tools.get_file_text", get_file_text)
+        monkeypatch.setattr("app.graph.nodes.get_file_text", get_file_text)
+        monkeypatch.setattr("app.graph.nodes.get_open_bot_threads", lambda pr, token: list(threads))
+        monkeypatch.setattr("app.graph.nodes.resolve_thread", lambda token, thread_id: resolved.append(thread_id))
+        return resolved
 
     return install

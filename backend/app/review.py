@@ -1,7 +1,8 @@
 """Review a real PR with a LangGraph:
-    fetch_pr -> triage -> specialists in parallel -> aggregate -> verify -> approve -> publish
+    fetch_pr -> triage -> specialists in parallel -> aggregate -> verify -> skip_seen -> approve -> publish -> resolve_fixed
     (publish posts to the PR only if the GitHub App is configured and installed there,
-     and then approve first asks you, right here in the terminal, which findings to post)
+     and then approve first asks you, right here in the terminal, which findings to post;
+     resolve_fixed then resolves the bot's threads whose code is gone)
 
 Run:  cd backend && uv run python -m app.review https://github.com/OWNER/REPO/pull/123
       add --show-graph to print the graph as a Mermaid diagram (no API calls)
@@ -34,10 +35,15 @@ def describe(node: str, update: dict) -> str:
     if node == "verify":
         checks = update["checks"]
         return f"kept {len(update['verified'])} of {len(checks)}"
+    if node == "skip_seen":
+        seen = sum(c.stage == "seen" for c in update["checks"])
+        return f"{len(update['verified'])} new, {seen} already raised on this PR"
     if node == "approve":
         return f"posting {len(update['approved'])} you approved"
     if node == "publish":
         return update["review_url"] or update["publish_note"]
+    if node == "resolve_fixed":
+        return update["resolve_note"]
     return ""
 
 
@@ -90,7 +96,7 @@ def main() -> None:
                     if node == "__interrupt__":  # the pause itself, not a node
                         continue
                     print(f"[{time.perf_counter() - start:5.1f}s] {node:<10} {describe(node, update)}")
-                    if node == "verify":
+                    if node in ("verify", "skip_seen"):
                         checks = update["checks"]
             interrupts = graph.get_state(config).interrupts
             if not interrupts:

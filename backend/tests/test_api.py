@@ -26,6 +26,7 @@ from sqlalchemy.exc import IntegrityError
 
 from app.api.main import create_app
 from app.db import Base
+from app.fingerprint import fingerprint
 from app.github_client import GitHubError
 from app.graph import build_graph
 from app.graph.checkpointer import open_checkpointer
@@ -234,7 +235,9 @@ def test_event_stream_tells_the_whole_story_in_order(client, fake_llm, fake_gith
         ("node", "specialist"),
         ("node", "aggregate"),
         ("node", "verify"),
+        ("node", "skip_seen"),
         ("node", "publish"),
+        ("node", "resolve_fixed"),
         ("done", None),
     ]
     data = [d for _, _, d in events]
@@ -242,7 +245,7 @@ def test_event_stream_tells_the_whole_story_in_order(client, fake_llm, fake_gith
                        "args": {"path": PATH, "start_line": 1, "end_line": 20}}
     assert data[4] == {"type": "agent", "agent": "correctness", "submitted": 1}
     assert [f["line"] for f in data[5]["findings"]] == [11]
-    assert data[8] == {"type": "node", "node": "publish", "review_url": None,
+    assert data[9] == {"type": "node", "node": "publish", "review_url": None,
                        "note": "not posted: no GitHub App configured"}
     assert data[-1] == {"type": "done", "kept": 1}
 
@@ -327,7 +330,7 @@ def test_worker_resumes_an_interrupted_review(db_url, fake_llm, fake_github, mon
     # second call would have failed the review.
     assert events[0][2] == {"type": "status", "status": "running", "resumed": True}
     assert [d.get("node") for _, name, d in events if name == "node"] == [
-        "specialist", "aggregate", "verify", "publish"]
+        "specialist", "aggregate", "verify", "skip_seen", "publish", "resolve_fixed"]
 
 
 def test_a_finished_review_is_not_run_twice(client, fake_llm, fake_github):
@@ -624,10 +627,12 @@ def test_review_waits_for_approval_then_posts(client, fake_llm, fake_github, ins
     events = [(name, d.get("node") or d.get("status")) for _, name, d in read_sse(client, review_id)]
     assert events[events.index(("node", "verify")):] == [
         ("node", "verify"),
+        ("node", "skip_seen"),
         ("status", "waiting"),  # the first job ends here
         ("status", "running"),  # the second one starts, from the checkpoint
         ("node", "approve"),
         ("node", "publish"),
+        ("node", "resolve_fixed"),
         ("done", None),
     ]
 
@@ -694,3 +699,24 @@ def test_queue_down_on_approval_keeps_the_review_waiting(client, fake_llm, fake_
     assert resp.status_code == 503
     body = client.get(f"/reviews/{review_id}").json()
     assert (body["status"], body["approved"]) == ("waiting", None)  # free to send it again
+
+
+def test_a_dismissed_finding_is_not_asked_about_again(client, fake_llm, fake_github, installed_app, pr_head):
+    review_id = waiting_review(client, fake_llm, fake_github)
+    client.post(f"/reviews/{review_id}/approval", json={"approved": []})
+    run_worker(client)
+    # Remembered on the review, as the finding's fingerprint.
+    assert client.get(f"/reviews/{review_id}").json()["dismissed"] == [fingerprint(make_pr(), finding(line=11))]
+
+    # Someone pushes, and the new review finds the same bug again.
+    pr_head["sha"] = "b" * 40
+    script_one_bug(fake_llm, fake_github)
+    second_id = client.post("/reviews", json={"pr_url": PR_URL}).json()["id"]
+    run_worker(client)
+
+    body = client.get(f"/reviews/{second_id}").json()
+    assert body["status"] == "done"  # no pause: there was nothing new to ask about
+    assert body["findings"] == []
+    assert (body["checks"][0]["stage"], body["checks"][0]["reason"]) == (
+        "seen", "dismissed in an earlier review of this PR")
+    assert installed_app == []

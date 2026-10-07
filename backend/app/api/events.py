@@ -31,7 +31,7 @@ def node_event(node: str, update: dict) -> dict[str, Any]:
         }
     elif node == "aggregate":
         event |= {"count": len(update["findings"])}
-    elif node == "verify":
+    elif node in ("verify", "skip_seen"):  # skip_seen sends the narrowed list, same shape
         event |= {
             "kept": len(update["verified"]),
             "checks": [c.model_dump(mode="json") for c in update["checks"]],
@@ -40,6 +40,8 @@ def node_event(node: str, update: dict) -> dict[str, Any]:
         event |= {"approved": len(update["approved"])}
     elif node == "publish":
         event |= {"review_url": update["review_url"], "note": update["publish_note"]}
+    elif node == "resolve_fixed":
+        event |= {"resolved": update["resolved"], "note": update["resolve_note"]}
     return event
 
 

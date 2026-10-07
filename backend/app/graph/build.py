@@ -1,9 +1,11 @@
 """Wire nodes into a graph:
 
-    START -> fetch_pr -> triage -> specialist x N (parallel) -> aggregate -> verify -> approve -> publish -> END
-                                \\-------- (empty plan) --------/            \\-- (nothing to ask) --/
+    START -> fetch_pr -> triage -> specialist x N (parallel) -> aggregate -> verify -> skip_seen -> approve -> publish -> resolve_fixed -> END
+                                \\-------- (empty plan) --------/                         \\-- (nothing to ask) --/
 
+skip_seen drops what's already on the PR or was dismissed before.
 approve pauses the run (interrupt) until a human decides what gets posted.
+resolve_fixed marks the bot's threads resolved where the code they point at is gone.
 """
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
@@ -14,8 +16,10 @@ from app.graph.nodes import (
     approve,
     fetch_pr,
     publish,
-    route_after_verify,
+    resolve_fixed,
+    route_to_approval,
     route_to_specialists,
+    skip_seen,
     specialist,
     triage,
     verify,
@@ -31,8 +35,10 @@ def build_graph(checkpointer: BaseCheckpointSaver | None = None):
     builder.add_node("specialist", specialist)
     builder.add_node("aggregate", aggregate)
     builder.add_node("verify", verify)
+    builder.add_node("skip_seen", skip_seen)
     builder.add_node("approve", approve)
     builder.add_node("publish", publish)
+    builder.add_node("resolve_fixed", resolve_fixed)
 
     builder.add_edge(START, "fetch_pr")
     builder.add_edge("fetch_pr", "triage")
@@ -42,9 +48,11 @@ def build_graph(checkpointer: BaseCheckpointSaver | None = None):
     # aggregate runs once, after every parallel specialist in the step has finished.
     builder.add_edge("specialist", "aggregate")
     builder.add_edge("aggregate", "verify")
-    builder.add_conditional_edges("verify", route_after_verify, ["approve", "publish"])
+    builder.add_edge("verify", "skip_seen")
+    builder.add_conditional_edges("skip_seen", route_to_approval, ["approve", "publish"])
     builder.add_edge("approve", "publish")
-    builder.add_edge("publish", END)
+    builder.add_edge("publish", "resolve_fixed")
+    builder.add_edge("resolve_fixed", END)
 
     # compile() validates the wiring (no dangling nodes, no missing edges)
     # and returns a runnable with .invoke() / .stream().

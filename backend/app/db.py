@@ -44,6 +44,9 @@ class ReviewRow(Base):
     # A human's decision at the approval step: positions in `findings` to
     # post. NULL until someone decides (and on reviews nobody had to approve).
     approved: Mapped[list[int] | None] = mapped_column(Json)
+    # Fingerprints (app/fingerprint.py) of the findings not approved, so later
+    # reviews of the PR don't ask about them again. '[]' for existing rows.
+    dismissed: Mapped[list[str]] = mapped_column(Json, default=list, server_default=text("'[]'"))
 
     # At most one *live* review per (PR, commit). A partial index only covers
     # the rows matching its WHERE, so a failed review drops out of it and the

@@ -11,7 +11,10 @@ from app.schemas import Finding, FindingCheck, PullRequest, Specialist, TriagePl
 
 
 class ReviewState(TypedDict):
-    pr_url: str  # input: the only key the caller provides
+    pr_url: str  # input
+    # input, optional: fingerprints of findings a human dismissed in earlier
+    # reviews of this PR. The worker reads them from Postgres.
+    known_dismissed: NotRequired[list[str]]
     pr: NotRequired[PullRequest]  # written by fetch_pr
     plan: NotRequired[TriagePlan]  # written by triage
 
@@ -24,17 +27,22 @@ class ReviewState(TypedDict):
 
     findings: NotRequired[list[Finding]]  # written by aggregate: deduped and sorted
 
-    # written by verify
+    # written by verify, then narrowed by skip_seen to what's new on this PR
     checks: NotRequired[list[FindingCheck]]  # every finding with its verdict, kept or not
     verified: NotRequired[list[Finding]]  # only the kept ones, sorted: the final answer
 
     # written by approve: the verified findings a human chose to post. Missing
     # when nobody was asked (nothing to post, or nowhere to post it).
     approved: NotRequired[list[Finding]]
+    dismissed: NotRequired[list[str]]  # written by approve: fingerprints of the rest
 
     # written by publish
     review_url: NotRequired[str | None]  # the review on GitHub, or None if not posted
     publish_note: NotRequired[str]  # what happened, in words: posted, or why not
+
+    # written by resolve_fixed
+    resolved: NotRequired[list[str]]  # the file of each thread marked resolved
+    resolve_note: NotRequired[str]  # what happened, in words
 
 
 class SpecialistInput(TypedDict):

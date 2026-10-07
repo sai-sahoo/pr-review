@@ -100,7 +100,12 @@ async def run_review(ctx: dict, review_id: str) -> None:
     saved = await graph.aget_state(config)
     resuming = bool(saved.values)
     if not resuming:
-        graph_input = {"pr_url": record.pr_url}
+        graph_input = {
+            "pr_url": record.pr_url,
+            # What a human said no to in earlier reviews of this PR, so this
+            # one doesn't ask again. Read now, at the start: a fresh run only.
+            "known_dismissed": await store.dismissed_fingerprints(record.pr_url),
+        }
     elif saved.interrupts and record.approved is not None:
         # Paused at approve, and a human has decided since: hand the decision
         # to the interrupt() that's waiting for it. It comes from Postgres,
@@ -173,6 +178,7 @@ async def run_review(ctx: dict, review_id: str) -> None:
         title=final["pr"].title,
         findings=final["verified"],
         checks=final["checks"],
+        dismissed=final.get("dismissed", []),
         finished_at=datetime.now(UTC),
     )
     # The record is final before this event goes out, so a client that

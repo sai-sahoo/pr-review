@@ -53,6 +53,7 @@ class ReviewRecord(BaseModel):
     checks: list[FindingCheck] = []  # every finding with the verifier's decision
     error: str | None = None  # set when status == "failed"
     approved: list[int] | None = None  # the findings (by position) a human chose to post
+    dismissed: list[str] = []  # fingerprints of the findings a human chose not to post
 
 
 # The API speaks ReviewRecord (Pydantic); the database speaks ReviewRow
@@ -134,6 +135,12 @@ class ReviewStore:
         async with self._sessions() as session:
             rows = await session.scalars(select(ReviewRow).where(ReviewRow.status.in_(UNFINISHED)))
             return [_to_record(row) for row in rows]
+
+    async def dismissed_fingerprints(self, pr_url: str) -> list[str]:
+        """Every finding a human dismissed in any review of this PR, as fingerprints."""
+        async with self._sessions() as session:
+            lists = await session.scalars(select(ReviewRow.dismissed).where(ReviewRow.pr_url == pr_url))
+            return sorted({fp for fps in lists for fp in fps})
 
     async def update(self, review_id: str, **changes) -> ReviewRecord:
         async with self._sessions.begin() as session:

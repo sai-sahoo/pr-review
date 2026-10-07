@@ -17,7 +17,8 @@ export default function ReviewPage() {
   // Kept in the server's order, not re-sorted: the approval sends positions
   // in this list (the record's `findings`). It's already sorted by severity.
   const kept = checks?.filter((c) => c.kept) ?? [];
-  const dropped = checks?.filter((c) => !c.kept) ?? [];
+  const dropped = checks?.filter((c) => !c.kept && c.stage !== "seen") ?? [];
+  const seen = checks?.filter((c) => c.stage === "seen") ?? [];
 
   // Approval: every finding starts ticked; you untick the ones to dismiss.
   const waiting = review.status === "waiting";
@@ -99,6 +100,12 @@ export default function ReviewPage() {
           )}
         </p>
       )}
+      {review.resolved && (
+        <p className="muted">
+          Earlier comments: {review.resolved.note}
+          {review.resolved.files.length > 0 && ` (${review.resolved.files.join(", ")})`}
+        </p>
+      )}
 
       {plan && (
         <section>
@@ -129,7 +136,7 @@ export default function ReviewPage() {
       {checks ? (
         <section>
           <h2>Findings ({kept.length} verified)</h2>
-          {kept.length === 0 && <p className="muted">No problems found.</p>}
+          {kept.length === 0 && <p className="muted">{seen.length ? "Nothing new." : "No problems found."}</p>}
           {kept.map((c, i) => (
             <FindingCard
               key={i}
@@ -137,6 +144,14 @@ export default function ReviewPage() {
               {...(waiting && { selected: !dismissed.has(i), onToggle: () => toggle(i) })}
             />
           ))}
+          {seen.length > 0 && (
+            <details>
+              <summary>{seen.length} already raised on this PR</summary>
+              {seen.map((c, i) => (
+                <FindingCard key={i} finding={c.finding} note={c.reason} />
+              ))}
+            </details>
+          )}
           {dropped.length > 0 && (
             <details>
               <summary>{dropped.length} dropped by the verifier</summary>

@@ -19,7 +19,7 @@ export type Finding = {
 export type FindingCheck = {
   finding: Finding;
   kept: boolean;
-  stage: "grounding" | "verifier";
+  stage: "grounding" | "verifier" | "seen"; // seen: already on the PR, or dismissed before
   confidence: number | null;
   reason: string;
 };
@@ -34,8 +34,10 @@ export type ReviewEvent =
   | { type: "node"; node: "specialist"; findings: Finding[]; log: string[] }
   | { type: "node"; node: "aggregate"; count: number }
   | { type: "node"; node: "verify"; kept: number; checks: FindingCheck[] }
+  | { type: "node"; node: "skip_seen"; kept: number; checks: FindingCheck[] }
   | { type: "node"; node: "approve"; approved: number }
   | { type: "node"; node: "publish"; review_url: string | null; note: string }
+  | { type: "node"; node: "resolve_fixed"; resolved: string[]; note: string }
   | { type: "agent"; agent: string; tool: string; args: Record<string, unknown> }
   | { type: "agent"; agent: string; submitted: number }
   | { type: "done"; kept: number }
